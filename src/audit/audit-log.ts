@@ -15,6 +15,9 @@ export interface AuditEntry {
   replayLag?: number;
   threshold?: number;
   limits?: Record<string, number>;
+  metric?: string;
+  value?: number;
+  metrics?: Record<string, unknown>;
   reason?: string;
 }
 

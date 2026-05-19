@@ -1262,3 +1262,209 @@ test("transient latency spike audits warning without SAFE_MODE", async () => {
 
   await runtime.stop();
 });
+
+test("runtime health metrics count processed and rejected events", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    seq: 1,
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_metrics_accepted",
+    causationId: "test",
+    payload: { bid: 100, ask: 101 }
+  });
+  await assert.rejects(
+    runtime.ingest({
+      seq: 1,
+      source: "test",
+      symbol: "BTCUSDT",
+      eventType: "MARKET_TICK",
+      correlationId: "corr_metrics_rejected",
+      causationId: "test",
+      payload: { bid: 102, ask: 103 }
+    }),
+    /duplicate_seq:1/
+  );
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.eventsProcessed, 1);
+  assert.equal(health.eventsRejected, 1);
+  assert.equal(health.queueDepth, 0);
+  assert.equal(health.maxQueueDepthObserved, 0);
+  assert.equal(health.mode, "NORMAL");
+  assert.equal(health.running, true);
+
+  await runtime.stop();
+});
+
+test("runtime health metrics count SAFE_MODE and websocket reconnects", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+
+  await runtime.start();
+  await runtime.handleMarketStreamLifecycle({
+    action: "reconnecting",
+    symbol: "BTCUSDT",
+    stream: "bookTicker",
+    reason: "websocket_disconnect"
+  });
+  await runtime.handleMarketStreamLifecycle({
+    action: "disconnected",
+    symbol: "BTCUSDT",
+    stream: "bookTicker",
+    reason: "websocket_disconnect"
+  });
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.websocketReconnectCount, 1);
+  assert.equal(health.safeModeCount, 1);
+  assert.equal(health.mode, "SAFE_MODE");
+  assert.equal(eventStore.events[0]?.eventType, "SAFE_MODE");
+
+  await runtime.stop();
+});
+
+test("replay metrics track throughput", async () => {
+  const eventStore = new MemoryEventStore();
+  eventStore.append(eventWithSeq(1));
+  eventStore.append(eventWithSeq(2));
+  eventStore.append(eventWithSeq(3));
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore });
+
+  assert.deepEqual(runtime.replayPersisted(), []);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.replayEventsProcessed, 3);
+  assert.equal(health.replayThroughputEventsPerSecond > 0, true);
+
+  await runtime.stop();
+});
+
+test("critical metric breaches are audited", async () => {
+  const config = { ...baseConfig, maxReplayLag: 1 };
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  eventStore.append(eventWithSeq(1));
+  eventStore.append(eventWithSeq(2));
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
+
+  assert.deepEqual(runtime.replayPersisted(), []);
+
+  const breaches = audit.entries("runtime_metric_breach");
+  assert.equal(breaches.length, 1);
+  assert.equal(breaches[0]?.metric, "replay_lag");
+  assert.equal(breaches[0]?.value, 2);
+  assert.equal(breaches[0]?.threshold, 1);
+
+  await runtime.stop();
+});
+
+test("runtime periodically audits health reports", async () => {
+  const audit = new MemoryAuditLog();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore(), audit });
+
+  await runtime.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+  const reports = audit.entries("runtime_health_report");
+  assert.equal(reports.length >= 1, true);
+  assert.equal(typeof reports[0]?.metrics?.eventsProcessed, "number");
+  assert.equal(reports[0]?.metrics?.mode, "NORMAL");
+
+  await runtime.stop();
+});
+
+test("smoke: market tick to DRY_RUN order persists, audits, metrics, and replays", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_smoke_success",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_smoke_success",
+    causationId: "signal_smoke_success",
+    payload: { side: "BUY", type: "MARKET", quantity: 1, topOfBookQuantity: 10 }
+  });
+
+  assert.equal(runtime.state.mode(), "NORMAL");
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), [
+    "MARKET_TICK",
+    "INTENT_CREATED",
+    "ORDER_SUBMITTED"
+  ]);
+  assert.equal(eventStore.events[2]?.source, "execution");
+  assert.equal(eventStore.events[2]?.payload.status, "SUBMITTED");
+  assert.equal(audit.entries("event_accepted").length, 3);
+  assert.equal(audit.entries("dry_run_order_submitted_generated").length, 1);
+
+  const healthBeforeReplay = runtime.healthSnapshot();
+  assert.equal(healthBeforeReplay.eventsProcessed, 3);
+  assert.equal(healthBeforeReplay.eventsRejected, 0);
+  assert.equal(healthBeforeReplay.safeModeCount, 0);
+
+  assert.deepEqual(runtime.replayPersisted(), []);
+  const healthAfterReplay = runtime.healthSnapshot();
+  assert.equal(healthAfterReplay.replayEventsProcessed, 3);
+  assert.equal(healthAfterReplay.replayThroughputEventsPerSecond > 0, true);
+
+  await runtime.stop();
+});
+
+test("smoke: stale market data enters SAFE_MODE without DRY_RUN order", async () => {
+  const config = { ...baseConfig, staleDataHaltMs: 1 };
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
+  const staleTimestamp = Date.now() - 10_000;
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "ETHUSDT",
+    eventType: "MARKET_TICK",
+    timestamp: staleTimestamp,
+    receiveTimestamp: staleTimestamp,
+    correlationId: "corr_smoke_failure",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "ETHUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_smoke_failure",
+    causationId: "signal_smoke_failure",
+    payload: { side: "BUY", type: "MARKET", quantity: 1 }
+  });
+
+  assert.equal(runtime.state.mode(), "SAFE_MODE");
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["MARKET_TICK", "SAFE_MODE"]);
+  assert.equal(eventStore.events.some((event) => event.eventType === "ORDER_SUBMITTED"), false);
+  assert.equal(eventStore.events[1]?.payload.reason, "stale_data_halt");
+  assert.equal(audit.entries("safe_mode_entered").length, 1);
+  assert.equal(audit.entries("safe_mode_entered")[0]?.reason, "stale_data_halt");
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.eventsProcessed, 2);
+  assert.equal(health.eventsRejected, 0);
+  assert.equal(health.safeModeCount, 1);
+
+  await runtime.stop();
+});

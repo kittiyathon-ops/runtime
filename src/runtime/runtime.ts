@@ -61,6 +61,35 @@ type RuntimeSnapshot = {
   risk: RiskState;
 };
 
+interface RuntimeMetrics {
+  eventsProcessed: number;
+  eventsRejected: number;
+  maxQueueDepthObserved: number;
+  lastProcessingLatencyMs: number;
+  maxProcessingLatencyMs: number;
+  replayEventsProcessed: number;
+  replayThroughputEventsPerSecond: number;
+  safeModeCount: number;
+  websocketReconnectCount: number;
+}
+
+export interface RuntimeHealth {
+  mode: RuntimeMode;
+  running: boolean;
+  seq: number;
+  queueDepth: number;
+  activeIngests: number;
+  eventsProcessed: number;
+  eventsRejected: number;
+  maxQueueDepthObserved: number;
+  lastProcessingLatencyMs: number;
+  maxProcessingLatencyMs: number;
+  replayEventsProcessed: number;
+  replayThroughputEventsPerSecond: number;
+  safeModeCount: number;
+  websocketReconnectCount: number;
+}
+
 class BoundedIdSet<T> {
   private readonly values = new Set<T>();
   private readonly order: T[] = [];
@@ -107,6 +136,8 @@ export class TradingRuntime {
 
   private timer?: NodeJS.Timeout;
 
+  private static readonly HEALTH_REPORT_INTERVAL_MS = 1_000;
+
   private readonly config: RuntimeRiskConfig;
 
   private readonly eventStore: EventStore;
@@ -130,6 +161,18 @@ export class TradingRuntime {
   private readonly submittedOrderKeys: BoundedIdSet<string>;
 
   private readonly expectedPositions = new Map<string, number>();
+
+  private readonly metrics: RuntimeMetrics = {
+    eventsProcessed: 0,
+    eventsRejected: 0,
+    maxQueueDepthObserved: 0,
+    lastProcessingLatencyMs: 0,
+    maxProcessingLatencyMs: 0,
+    replayEventsProcessed: 0,
+    replayThroughputEventsPerSecond: 0,
+    safeModeCount: 0,
+    websocketReconnectCount: 0
+  };
 
   public readonly events: AsyncEventBus;
 
@@ -182,6 +225,10 @@ export class TradingRuntime {
       runtimeProfile: this.config.runtimeProfile,
       limits: this.auditLimits()
     });
+    this.timer = setInterval(() => {
+      this.reportRuntimeHealth();
+    }, TradingRuntime.HEALTH_REPORT_INTERVAL_MS);
+    this.timer.unref?.();
 
     console.log("runtime.start()");
   }
@@ -338,7 +385,9 @@ export class TradingRuntime {
       if (previousMode !== "REPLAY") {
         this.state.transition("REPLAY");
       }
+      const startedAt = Date.now();
       const events = this.eventStore.readFrom(fromSeq, limit);
+      this.observeReplayThroughput(events.length, Date.now() - startedAt);
       this.observeReplayLag(events.length);
       const mismatches = this.replay.verify(events);
       if (mismatches.length > 0) {
@@ -367,6 +416,27 @@ export class TradingRuntime {
 
   transitionMode(mode: RuntimeMode): void {
     this.state.transition(mode);
+  }
+
+  healthSnapshot(): RuntimeHealth {
+    const queueDepth = this.events.size();
+    this.observeQueueDepth(queueDepth);
+    return {
+      mode: this.state.mode(),
+      running: this.running,
+      seq: this.seq,
+      queueDepth,
+      activeIngests: this.activeIngests,
+      eventsProcessed: this.metrics.eventsProcessed,
+      eventsRejected: this.metrics.eventsRejected,
+      maxQueueDepthObserved: this.metrics.maxQueueDepthObserved,
+      lastProcessingLatencyMs: this.metrics.lastProcessingLatencyMs,
+      maxProcessingLatencyMs: this.metrics.maxProcessingLatencyMs,
+      replayEventsProcessed: this.metrics.replayEventsProcessed,
+      replayThroughputEventsPerSecond: this.metrics.replayThroughputEventsPerSecond,
+      safeModeCount: this.metrics.safeModeCount,
+      websocketReconnectCount: this.metrics.websocketReconnectCount
+    };
   }
 
   connectBinanceMarketData(symbol: string): void {
@@ -416,6 +486,9 @@ export class TradingRuntime {
     stream: BinanceMarketStreamKind;
     reason?: string;
   }): Promise<void> {
+    if (event.action === "reconnecting") {
+      this.metrics.websocketReconnectCount += 1;
+    }
     this.auditDecision({
       action: `market_stream_${event.action}`,
       symbol: event.symbol,
@@ -522,9 +595,11 @@ export class TradingRuntime {
 
   private assertQueueDepthAllowsIngest(input: EventInput): void {
     const queueDepth = this.events.size();
+    this.observeQueueDepth(queueDepth);
     if (queueDepth < this.config.maxQueueDepth) return;
 
     const reason = "queue_depth_halt";
+    this.auditMetricBreach("queue_depth", queueDepth, this.config.maxQueueDepth, reason);
     this.auditDecision({
       action: "backpressure_breach",
       eventType: input.eventType,
@@ -538,8 +613,11 @@ export class TradingRuntime {
   }
 
   private async observeProcessingLatency(processingLatencyMs: number, event?: RuntimeEvent): Promise<void> {
+    this.metrics.lastProcessingLatencyMs = processingLatencyMs;
+    this.metrics.maxProcessingLatencyMs = Math.max(this.metrics.maxProcessingLatencyMs, processingLatencyMs);
     if (processingLatencyMs > this.config.latencyHaltMs) {
       const reason = "processing_latency_halt";
+      this.auditMetricBreach("processing_latency_ms", processingLatencyMs, this.config.latencyHaltMs, reason);
       this.auditDecision({
         action: "latency_breach",
         ...(event === undefined
@@ -576,6 +654,7 @@ export class TradingRuntime {
     if (replayLag <= this.config.maxReplayLag) return;
 
     const reason = "replay_lag_halt";
+    this.auditMetricBreach("replay_lag", replayLag, this.config.maxReplayLag, reason);
     this.auditDecision({
       action: "replay_lag_breach",
       replayLag,
@@ -640,7 +719,41 @@ export class TradingRuntime {
   }
 
   private auditDecision(entry: AuditEntry): void {
+    if (entry.action === "event_accepted") {
+      this.metrics.eventsProcessed += 1;
+    } else if (entry.action === "event_rejected") {
+      this.metrics.eventsRejected += 1;
+    } else if (entry.action === "safe_mode_entered") {
+      this.metrics.safeModeCount += 1;
+    }
     this.audit.record(entry);
+  }
+
+  private auditMetricBreach(metric: string, value: number, threshold: number, reason: string): void {
+    this.audit.record({
+      action: "runtime_metric_breach",
+      metric,
+      value,
+      threshold,
+      reason
+    });
+  }
+
+  private reportRuntimeHealth(): void {
+    this.auditDecision({
+      action: "runtime_health_report",
+      metrics: this.healthSnapshot() as unknown as Record<string, unknown>
+    });
+  }
+
+  private observeQueueDepth(queueDepth: number): void {
+    this.metrics.maxQueueDepthObserved = Math.max(this.metrics.maxQueueDepthObserved, queueDepth);
+  }
+
+  private observeReplayThroughput(eventCount: number, elapsedMs: number): void {
+    this.metrics.replayEventsProcessed += eventCount;
+    const elapsedSeconds = Math.max(1, elapsedMs) / 1_000;
+    this.metrics.replayThroughputEventsPerSecond = eventCount / elapsedSeconds;
   }
 
   private auditLimits(): Record<string, number> {
