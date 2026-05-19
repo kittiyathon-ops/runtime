@@ -98,6 +98,8 @@ const RawConfigSchema = z.object({
   maxExposureUsd: z.coerce.number().positive().optional(),
   maxDrawdownUsd: z.coerce.number().positive().optional(),
   idempotencyCacheSize: z.coerce.number().int().positive().optional(),
+  paperFillSimulationEnabled: z.boolean().default(false),
+  paperFillSlippageBps: z.coerce.number().nonnegative().default(0),
   binanceFuturesWsUrl: z.string().url().default("wss://fstream.binance.com"),
   binanceApiKey: z.string().default(""),
   binanceApiSecret: z.string().default("")
@@ -123,6 +125,8 @@ export const ConfigSchema = RawConfigSchema.transform((config) => {
   runtimeProfile: RuntimeProfileSchema,
   logLevel: z.string(),
   sqlitePath: z.string(),
+  paperFillSimulationEnabled: z.boolean(),
+  paperFillSlippageBps: z.number().nonnegative(),
   binanceFuturesWsUrl: z.string().url(),
   binanceApiKey: z.string(),
   binanceApiSecret: z.string(),
@@ -148,6 +152,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     maxExposureUsd: env.MAX_EXPOSURE_USD,
     maxDrawdownUsd: env.MAX_DRAWDOWN_USD,
     idempotencyCacheSize: env.IDEMPOTENCY_CACHE_SIZE,
+    paperFillSimulationEnabled: env.PAPER_FILL_SIMULATION_ENABLED === "true",
+    paperFillSlippageBps: env.PAPER_FILL_SLIPPAGE_BPS,
     binanceFuturesWsUrl: env.BINANCE_FUTURES_WS_URL,
     binanceApiKey: env.BINANCE_API_KEY,
     binanceApiSecret: env.BINANCE_API_SECRET

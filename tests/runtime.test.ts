@@ -9,8 +9,14 @@ import { createLogger } from "../src/infra/logger.js";
 import { RuntimeEventSchema, type EventInput, type RuntimeEvent } from "../src/core/event.js";
 import type { AuditEntry, AuditRecord } from "../src/audit/audit-log.js";
 import { ExecutionEngine } from "../src/execution/execution-engine.js";
+import { PaperPerformanceTracker } from "../src/execution/paper-performance-tracker.js";
 import { PortfolioState } from "../src/portfolio/portfolio-state.js";
 import { RiskEngine } from "../src/risk/risk-engine.js";
+import {
+  SpreadWideningSignalProvider,
+  type SignalProvider,
+  type SignalToIntentPolicy
+} from "../src/signals/signal-engine.js";
 
 class MemoryEventStore {
   readonly events: RuntimeEvent[] = [];
@@ -88,6 +94,8 @@ const baseConfig: RuntimeConfig = {
   maxExposureUsd: 10_000,
   maxDrawdownUsd: 1_000,
   idempotencyCacheSize: 100,
+  paperFillSimulationEnabled: false,
+  paperFillSlippageBps: 0,
   binanceFuturesWsUrl: "wss://fstream.binance.com",
   binanceApiKey: "",
   binanceApiSecret: ""
@@ -101,6 +109,27 @@ function profileConfig(runtimeProfile: RuntimeProfile): RuntimeConfig {
     sqlitePath: join(mkdtempSync(join(tmpdir(), "trading-runtime-")), "runtime.sqlite")
   });
 }
+
+const testSignalToIntentPolicy: SignalToIntentPolicy = {
+  id: "test_signal_to_intent_policy",
+  evaluate: (signal) => {
+    if (signal.payload.signalType !== "SPREAD_WIDENING") {
+      return { allow: false, reason: "unsupported_test_signal" };
+    }
+    return {
+      allow: true,
+      intent: {
+        payload: {
+          side: "BUY",
+          type: "MARKET",
+          quantity: 1,
+          topOfBookQuantity: 10,
+          reduceOnly: false
+        }
+      }
+    };
+  }
+};
 
 test("runtime starts in NORMAL and checkpoints ingested market data", async () => {
   const eventStore = new MemoryEventStore();
@@ -899,6 +928,335 @@ test("generated ORDER_SUBMITTED is persisted and audited", async () => {
   await runtime.stop();
 });
 
+test("DRY_RUN order can generate simulated paper fill", async () => {
+  const config = { ...baseConfig, paperFillSimulationEnabled: true, paperFillSlippageBps: 5 };
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_paper_fill",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_paper_fill",
+    causationId: "signal_paper_fill",
+    payload: { side: "BUY", type: "MARKET", quantity: 2, topOfBookQuantity: 10 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), [
+    "MARKET_TICK",
+    "INTENT_CREATED",
+    "ORDER_SUBMITTED",
+    "ORDER_FILLED"
+  ]);
+  const fill = eventStore.events[3];
+  assert.equal(fill?.source, "execution");
+  assert.equal(fill?.payload.status, "FILLED");
+  assert.equal(fill?.payload.simulator, "paper_fill");
+  assert.equal(fill?.payload.slippageBps, 5);
+  assert.equal(fill?.payload.price, 101 * 1.0005);
+  assert.equal(audit.entries("paper_fill_generated").length, 1);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.paperFillsGenerated, 1);
+  assert.equal(health.simulatedSlippageBps, 5);
+  assert.equal(health.simulatedNotionalUsd, 2 * 101 * 1.0005);
+  assert.deepEqual(runtime.replayPersisted(), []);
+
+  await runtime.stop();
+});
+
+test("simulated paper fill updates PortfolioState", async () => {
+  const config = { ...baseConfig, paperFillSimulationEnabled: true, paperFillSlippageBps: 0 };
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore: new MemoryEventStore() });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "ETHUSDT",
+    eventType: "BOOK_UPDATE",
+    correlationId: "corr_paper_portfolio",
+    causationId: "market",
+    payload: { bidPrice: 200, askPrice: 201 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "ETHUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_paper_portfolio",
+    causationId: "signal_paper_portfolio",
+    payload: { side: "BUY", type: "MARKET", quantity: 3, topOfBookQuantity: 10 }
+  });
+
+  const position = runtime.portfolio.snapshot().positions.ETHUSDT;
+  assert.equal(position?.quantity, 3);
+  assert.equal(position?.averagePrice, 201);
+  assert.equal(runtime.portfolio.exposureUsd(), 603);
+
+  await runtime.stop();
+});
+
+test("missing market snapshot prevents paper fill generation", async () => {
+  const config = { ...baseConfig, paperFillSimulationEnabled: true, paperFillSlippageBps: 1 };
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_missing_snapshot",
+    causationId: "market",
+    payload: { price: 100 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_missing_snapshot",
+    causationId: "signal_missing_snapshot",
+    payload: { side: "BUY", type: "MARKET", quantity: 1, topOfBookQuantity: 10 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["MARKET_TICK", "INTENT_CREATED", "ORDER_SUBMITTED"]);
+  assert.equal(audit.entries("paper_fill_skipped").length, 1);
+  assert.equal(audit.entries("paper_fill_skipped")[0]?.reason, "missing_market_snapshot");
+  assert.equal(runtime.healthSnapshot().paperFillsGenerated, 0);
+
+  await runtime.stop();
+});
+
+test("SAFE_MODE and HALTED prevent paper fills", async () => {
+  const config = { ...baseConfig, paperFillSimulationEnabled: true, paperFillSlippageBps: 0 };
+  const safeAudit = new MemoryAuditLog();
+  const safeStore = new MemoryEventStore();
+  const safeRuntime = new TradingRuntime({ config, logger: createLogger(config), eventStore: safeStore, audit: safeAudit });
+
+  await safeRuntime.start();
+  await safeRuntime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_safe_paper_fill",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  safeRuntime.transitionMode("SAFE_MODE");
+  await safeRuntime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_SUBMITTED",
+    correlationId: "corr_safe_paper_fill",
+    causationId: "manual_order",
+    payload: { side: "BUY", type: "MARKET", quantity: 1, status: "SUBMITTED" }
+  });
+
+  assert.deepEqual(safeStore.events.map((event) => event.eventType), ["MARKET_TICK", "ORDER_SUBMITTED"]);
+  assert.equal(safeAudit.entries("paper_fill_skipped")[0]?.reason, "runtime_mode_disallows_paper_fill");
+  assert.equal(safeRuntime.healthSnapshot().paperFillsGenerated, 0);
+  await safeRuntime.stop();
+
+  const haltedStore = new MemoryEventStore();
+  const haltedRuntime = new TradingRuntime({ config, logger: createLogger(config), eventStore: haltedStore });
+  await haltedRuntime.start();
+  haltedRuntime.transitionMode("HALTED");
+  await assert.rejects(
+    haltedRuntime.ingest({
+      source: "execution",
+      symbol: "BTCUSDT",
+      eventType: "ORDER_SUBMITTED",
+      correlationId: "corr_halted_paper_fill",
+      causationId: "manual_order",
+      payload: { side: "BUY", type: "MARKET", quantity: 1, status: "SUBMITTED" }
+    }),
+    /runtime_shutdown/
+  );
+  assert.equal(haltedStore.events.length, 0);
+  assert.equal(haltedRuntime.healthSnapshot().paperFillsGenerated, 0);
+  await haltedRuntime.stop();
+});
+
+test("paper performance long fill updates exposure and average price", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_long",
+    causationId: "order_perf_long",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 2, price: 100, status: "FILLED" }
+  });
+
+  const snapshot = runtime.paperPerformanceSnapshot();
+  assert.equal(snapshot.currentExposureUsd, 200);
+  assert.equal(snapshot.averageFillPrice, 100);
+  assert.equal(snapshot.positions.BTCUSDT?.quantity, 2);
+  assert.equal(snapshot.positions.BTCUSDT?.averagePrice, 100);
+  assert.equal(audit.entries("paper_performance_updated").length, 1);
+  assert.equal(eventStore.events[0]?.eventType, "ORDER_FILLED");
+
+  await runtime.stop();
+});
+
+test("paper performance closing fill realizes PnL", async () => {
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore() });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_win",
+    causationId: "order_perf_open",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 2, price: 100, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_win",
+    causationId: "order_perf_close",
+    payload: { simulator: "paper_fill", side: "SELL", quantity: -2, price: 110, status: "FILLED" }
+  });
+
+  const snapshot = runtime.paperPerformanceSnapshot();
+  assert.equal(snapshot.realizedPnlUsd, 20);
+  assert.equal(snapshot.totalTrades, 1);
+  assert.equal(snapshot.winningTrades, 1);
+  assert.equal(snapshot.losingTrades, 0);
+  assert.equal(snapshot.winRate, 1);
+  assert.equal(snapshot.grossProfitUsd, 20);
+  assert.equal(snapshot.currentExposureUsd, 0);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.paperRealizedPnlUsd, 20);
+  assert.equal(health.paperWinRate, 1);
+
+  await runtime.stop();
+});
+
+test("paper performance losing trade updates gross loss", async () => {
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore() });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "execution",
+    symbol: "ETHUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_loss",
+    causationId: "order_loss_open",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 1, price: 100, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "ETHUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_loss",
+    causationId: "order_loss_close",
+    payload: { simulator: "paper_fill", side: "SELL", quantity: -1, price: 90, status: "FILLED" }
+  });
+
+  const snapshot = runtime.paperPerformanceSnapshot();
+  assert.equal(snapshot.realizedPnlUsd, -10);
+  assert.equal(snapshot.totalTrades, 1);
+  assert.equal(snapshot.winningTrades, 0);
+  assert.equal(snapshot.losingTrades, 1);
+  assert.equal(snapshot.grossLossUsd, 10);
+  assert.equal(snapshot.winRate, 0);
+
+  await runtime.stop();
+});
+
+test("paper performance max drawdown updates correctly", async () => {
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore() });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_drawdown",
+    causationId: "open_win",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 1, price: 100, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_drawdown",
+    causationId: "close_win",
+    payload: { simulator: "paper_fill", side: "SELL", quantity: -1, price: 110, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_drawdown",
+    causationId: "open_loss",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 1, price: 100, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_drawdown",
+    causationId: "close_loss",
+    payload: { simulator: "paper_fill", side: "SELL", quantity: -1, price: 85, status: "FILLED" }
+  });
+
+  const snapshot = runtime.paperPerformanceSnapshot();
+  assert.equal(snapshot.realizedPnlUsd, -5);
+  assert.equal(snapshot.grossProfitUsd, 10);
+  assert.equal(snapshot.grossLossUsd, 15);
+  assert.equal(snapshot.maxDrawdownUsd, 15);
+  assert.equal(runtime.healthSnapshot().paperMaxDrawdownUsd, 15);
+
+  await runtime.stop();
+});
+
+test("paper performance snapshot is replay-safe", async () => {
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_replay",
+    causationId: "open",
+    payload: { simulator: "paper_fill", side: "BUY", quantity: 2, price: 100, status: "FILLED" }
+  });
+  await runtime.ingest({
+    source: "execution",
+    symbol: "BTCUSDT",
+    eventType: "ORDER_FILLED",
+    correlationId: "corr_perf_replay",
+    causationId: "close",
+    payload: { simulator: "paper_fill", side: "SELL", quantity: -2, price: 105, status: "FILLED" }
+  });
+
+  assert.deepEqual(runtime.replayPersisted(), []);
+  assert.deepEqual(runtime.paperPerformanceSnapshot(), PaperPerformanceTracker.replay(eventStore.events));
+
+  await runtime.stop();
+});
+
 test("runtime refuses simulated order submission in HALTED", async () => {
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore() });
   const published: RuntimeEvent[] = [];
@@ -1298,6 +1656,198 @@ test("runtime health metrics count processed and rejected events", async () => {
   assert.equal(health.maxQueueDepthObserved, 0);
   assert.equal(health.mode, "NORMAL");
   assert.equal(health.running, true);
+
+  await runtime.stop();
+});
+
+test("signal providers can register", async () => {
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore() });
+  const firstProvider: SignalProvider = {
+    id: "test_signal_provider_1",
+    evaluate: () => []
+  };
+  const secondProvider: SignalProvider = {
+    id: "test_signal_provider_2",
+    evaluate: () => []
+  };
+
+  runtime.registerSignalProvider(firstProvider);
+  runtime.registerSignalProvider(secondProvider);
+
+  assert.deepEqual(runtime.signals.listProviders().map((provider) => provider.id), [
+    "test_signal_provider_1",
+    "test_signal_provider_2"
+  ]);
+  assert.throws(() => runtime.registerSignalProvider(firstProvider), /signal_provider_duplicate:test_signal_provider_1/);
+
+  await runtime.stop();
+});
+
+test("spread widening provider generates canonical SIGNAL_CREATED", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+  runtime.registerSignalProvider(new SpreadWideningSignalProvider(50));
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "BOOK_UPDATE",
+    correlationId: "corr_spread_signal",
+    causationId: "market",
+    payload: { bidPrice: 100, askPrice: 102 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["BOOK_UPDATE", "SIGNAL_CREATED"]);
+  const signal = eventStore.events[1];
+  assert.equal(signal?.source, "runtime");
+  assert.equal(signal?.symbol, "BTCUSDT");
+  assert.equal(signal?.correlationId, "corr_spread_signal");
+  assert.equal(signal?.causationId, "1");
+  assert.equal(signal?.payload.providerId, "spread_widening_detector");
+  assert.equal(signal?.payload.signalType, "SPREAD_WIDENING");
+  assert.equal(audit.entries("event_accepted").length, 2);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.eventsProcessed, 2);
+  assert.equal(health.signalsGenerated, 1);
+  assert.equal(health.signalsRejected, 0);
+  assert.deepEqual(runtime.replayPersisted(), []);
+
+  await runtime.stop();
+});
+
+test("invalid signal outputs are rejected without rejecting market event", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+  runtime.registerSignalProvider({
+    id: "invalid_signal_provider",
+    evaluate: () => [
+      {
+        signalType: "INVALID_SIGNAL",
+        symbol: "",
+        payload: { reason: "test_invalid_symbol" }
+      }
+    ]
+  });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_invalid_signal",
+    causationId: "market",
+    payload: { bid: 100, ask: 105 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["MARKET_TICK"]);
+  assert.equal(audit.entries("event_rejected").length, 1);
+  assert.equal(audit.entries("signal_rejected").length, 1);
+  assert.match(audit.entries("signal_rejected")[0]?.reason ?? "", /Too small/);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.eventsProcessed, 1);
+  assert.equal(health.eventsRejected, 1);
+  assert.equal(health.signalsGenerated, 0);
+  assert.equal(health.signalsRejected, 1);
+
+  await runtime.stop();
+});
+
+test("default SignalToIntentPolicy rejects signal conversion", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_default_signal_intent",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  await runtime.ingest({
+    source: "runtime",
+    symbol: "BTCUSDT",
+    eventType: "SIGNAL_CREATED",
+    correlationId: "corr_default_signal_intent",
+    causationId: "1",
+    payload: { providerId: "test", signalType: "SPREAD_WIDENING", confidence: 1 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["MARKET_TICK", "SIGNAL_CREATED"]);
+  assert.equal(audit.entries("signal_intent_rejected").length, 1);
+  assert.equal(audit.entries("signal_intent_rejected")[0]?.reason, "signal_to_intent_disabled");
+  assert.equal(eventStore.events.some((event) => event.eventType === "INTENT_CREATED"), false);
+
+  await runtime.stop();
+});
+
+test("test SignalToIntentPolicy generates INTENT_CREATED and DRY_RUN ORDER_SUBMITTED", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+  runtime.registerSignalProvider(new SpreadWideningSignalProvider(50));
+  runtime.registerSignalToIntentPolicy(testSignalToIntentPolicy);
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "BOOK_UPDATE",
+    correlationId: "corr_test_signal_intent",
+    causationId: "market",
+    payload: { bidPrice: 100, askPrice: 102 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), [
+    "BOOK_UPDATE",
+    "SIGNAL_CREATED",
+    "INTENT_CREATED",
+    "ORDER_SUBMITTED"
+  ]);
+  assert.equal(eventStore.events[2]?.source, "runtime");
+  assert.equal(eventStore.events[2]?.payload.policyId, "test_signal_to_intent_policy");
+  assert.equal(eventStore.events[3]?.source, "execution");
+  assert.equal(eventStore.events[3]?.payload.status, "SUBMITTED");
+  assert.equal(audit.entries("signal_intent_generated").length, 1);
+  assert.equal(audit.entries("dry_run_order_submitted_generated").length, 1);
+
+  const health = runtime.healthSnapshot();
+  assert.equal(health.eventsProcessed, 4);
+  assert.equal(health.signalsGenerated, 1);
+  assert.deepEqual(runtime.replayPersisted(), []);
+
+  await runtime.stop();
+});
+
+test("SAFE_MODE blocks signal-to-intent conversion", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
+  runtime.registerSignalToIntentPolicy(testSignalToIntentPolicy);
+
+  await runtime.start();
+  runtime.transitionMode("SAFE_MODE");
+  await runtime.ingest({
+    source: "runtime",
+    symbol: "BTCUSDT",
+    eventType: "SIGNAL_CREATED",
+    correlationId: "corr_safe_signal_intent",
+    causationId: "test",
+    payload: { providerId: "test", signalType: "SPREAD_WIDENING", confidence: 1 }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["SIGNAL_CREATED"]);
+  assert.equal(eventStore.events.some((event) => event.eventType === "INTENT_CREATED"), false);
+  assert.equal(eventStore.events.some((event) => event.eventType === "ORDER_SUBMITTED"), false);
+  assert.equal(audit.entries("signal_intent_rejected").length, 1);
+  assert.equal(audit.entries("signal_intent_rejected")[0]?.reason, "runtime_mode_disallows_signal_intent");
 
   await runtime.stop();
 });

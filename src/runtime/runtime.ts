@@ -10,6 +10,8 @@ import { RuntimeEventSchema } from "../core/event.js";
 import { SystemClock } from "../core/clock.js";
 import { rootCorrelationId } from "../core/ids.js";
 import { ExecutionEngine } from "../execution/execution-engine.js";
+import { PaperFillSimulator, type MarketSnapshot } from "../execution/paper-fill-simulator.js";
+import { PaperPerformanceTracker, type PaperPerformanceSnapshot } from "../execution/paper-performance-tracker.js";
 import { ConfigSchema, type RuntimeConfig, type RuntimeConfigInput } from "../infra/config.js";
 import { AsyncEventBus } from "../infra/event-bus.js";
 import type { EventStore } from "../infra/event-store.js";
@@ -19,6 +21,13 @@ import { SqliteEventStore } from "../infra/sqlite-event-store.js";
 import { PortfolioState } from "../portfolio/portfolio-state.js";
 import { ReplayEngine, type ReplayMismatch } from "../replay/replay-engine.js";
 import { RiskEngine, type RiskDecision, type RiskState } from "../risk/risk-engine.js";
+import {
+  RejectAllSignalToIntentPolicy,
+  SignalEngine,
+  signalIntentDecisionToEventInput,
+  type SignalProvider,
+  type SignalToIntentPolicy
+} from "../signals/signal-engine.js";
 import { RuntimeStateMachine, type RuntimeMode } from "./state-machine.js";
 
 type RuntimeRiskConfig = Pick<
@@ -36,6 +45,8 @@ type RuntimeRiskConfig = Pick<
   | "latencyHaltMs"
   | "maxDrawdownUsd"
   | "idempotencyCacheSize"
+  | "paperFillSimulationEnabled"
+  | "paperFillSlippageBps"
   | "binanceFuturesWsUrl"
 >;
 
@@ -49,6 +60,7 @@ type RuntimeDeps = {
   portfolio?: PortfolioState;
   replay?: ReplayEngine;
   risk?: RiskEngine;
+  signals?: SignalEngine;
   shutdown?: ShutdownController;
 };
 
@@ -71,6 +83,15 @@ interface RuntimeMetrics {
   replayThroughputEventsPerSecond: number;
   safeModeCount: number;
   websocketReconnectCount: number;
+  signalsGenerated: number;
+  signalsRejected: number;
+  paperFillsGenerated: number;
+  simulatedSlippageBps: number;
+  simulatedNotionalUsd: number;
+  paperRealizedPnlUsd: number;
+  paperUnrealizedPnlUsd: number;
+  paperMaxDrawdownUsd: number;
+  paperWinRate: number;
 }
 
 export interface RuntimeHealth {
@@ -88,6 +109,15 @@ export interface RuntimeHealth {
   replayThroughputEventsPerSecond: number;
   safeModeCount: number;
   websocketReconnectCount: number;
+  signalsGenerated: number;
+  signalsRejected: number;
+  paperFillsGenerated: number;
+  simulatedSlippageBps: number;
+  simulatedNotionalUsd: number;
+  paperRealizedPnlUsd: number;
+  paperUnrealizedPnlUsd: number;
+  paperMaxDrawdownUsd: number;
+  paperWinRate: number;
 }
 
 class BoundedIdSet<T> {
@@ -162,6 +192,14 @@ export class TradingRuntime {
 
   private readonly expectedPositions = new Map<string, number>();
 
+  private signalToIntentPolicy: SignalToIntentPolicy = new RejectAllSignalToIntentPolicy();
+
+  private readonly marketSnapshots = new Map<string, MarketSnapshot>();
+
+  private readonly paperFillSimulator: PaperFillSimulator;
+
+  private readonly paperPerformance = new PaperPerformanceTracker();
+
   private readonly metrics: RuntimeMetrics = {
     eventsProcessed: 0,
     eventsRejected: 0,
@@ -171,7 +209,16 @@ export class TradingRuntime {
     replayEventsProcessed: 0,
     replayThroughputEventsPerSecond: 0,
     safeModeCount: 0,
-    websocketReconnectCount: 0
+    websocketReconnectCount: 0,
+    signalsGenerated: 0,
+    signalsRejected: 0,
+    paperFillsGenerated: 0,
+    simulatedSlippageBps: 0,
+    simulatedNotionalUsd: 0,
+    paperRealizedPnlUsd: 0,
+    paperUnrealizedPnlUsd: 0,
+    paperMaxDrawdownUsd: 0,
+    paperWinRate: 0
   };
 
   public readonly events: AsyncEventBus;
@@ -183,6 +230,8 @@ export class TradingRuntime {
   public readonly replay: ReplayEngine;
 
   public readonly risk: RiskEngine;
+
+  public readonly signals: SignalEngine;
 
   public readonly shutdown: ShutdownController;
 
@@ -202,7 +251,9 @@ export class TradingRuntime {
     this.portfolio = deps?.portfolio ?? new PortfolioState();
     this.replay = deps?.replay ?? new ReplayEngine();
     this.risk = deps?.risk ?? new RiskEngine(this.config, this.portfolio);
+    this.signals = deps?.signals ?? new SignalEngine();
     this.execution = deps?.execution ?? new ExecutionEngine(this.risk);
+    this.paperFillSimulator = new PaperFillSimulator(this.config.paperFillSlippageBps);
     this.shutdown = deps?.shutdown ?? new ShutdownController();
     this.shutdown.onShutdown(async () => {
       await this.waitForIngestIdle();
@@ -319,7 +370,9 @@ export class TradingRuntime {
       }
     } else {
       await this.publishAccepted(event, { bypassDuplicateChecks, checked: true });
+      this.observeMarketSnapshot(event);
       this.portfolio.apply(event);
+      this.observePaperPerformance(event);
       const reconciliation = this.reconcilePortfolio(event);
       if (!reconciliation.allow) {
         await this.enterSafeModeWithNextSeq(event, reconciliation);
@@ -330,6 +383,9 @@ export class TradingRuntime {
       if (!decision.allow) {
         await this.enterSafeModeWithNextSeq(event, decision);
       }
+      await this.evaluatePaperFill(event);
+      await this.evaluateSignalToIntentPolicy(event);
+      await this.evaluateSignals(event);
       this.saveCheckpoint();
       return event;
     }
@@ -368,6 +424,7 @@ export class TradingRuntime {
         }
         await this.publishAccepted(producedEvent);
         this.risk.observe(producedEvent);
+        await this.evaluatePaperFill(producedEvent);
       }
       if (result.events.some((producedEvent) => producedEvent.eventType === "ORDER_SUBMITTED")) {
         this.submittedOrderKeys.add(this.orderSubmissionKey(event));
@@ -418,6 +475,14 @@ export class TradingRuntime {
     this.state.transition(mode);
   }
 
+  registerSignalProvider(provider: SignalProvider): void {
+    this.signals.register(provider);
+  }
+
+  registerSignalToIntentPolicy(policy: SignalToIntentPolicy): void {
+    this.signalToIntentPolicy = policy;
+  }
+
   healthSnapshot(): RuntimeHealth {
     const queueDepth = this.events.size();
     this.observeQueueDepth(queueDepth);
@@ -435,8 +500,21 @@ export class TradingRuntime {
       replayEventsProcessed: this.metrics.replayEventsProcessed,
       replayThroughputEventsPerSecond: this.metrics.replayThroughputEventsPerSecond,
       safeModeCount: this.metrics.safeModeCount,
-      websocketReconnectCount: this.metrics.websocketReconnectCount
+      websocketReconnectCount: this.metrics.websocketReconnectCount,
+      signalsGenerated: this.metrics.signalsGenerated,
+      signalsRejected: this.metrics.signalsRejected,
+      paperFillsGenerated: this.metrics.paperFillsGenerated,
+      simulatedSlippageBps: this.metrics.simulatedSlippageBps,
+      simulatedNotionalUsd: this.metrics.simulatedNotionalUsd,
+      paperRealizedPnlUsd: this.metrics.paperRealizedPnlUsd,
+      paperUnrealizedPnlUsd: this.metrics.paperUnrealizedPnlUsd,
+      paperMaxDrawdownUsd: this.metrics.paperMaxDrawdownUsd,
+      paperWinRate: this.metrics.paperWinRate
     };
+  }
+
+  paperPerformanceSnapshot(): PaperPerformanceSnapshot {
+    return this.paperPerformance.snapshot();
   }
 
   connectBinanceMarketData(symbol: string): void {
@@ -508,6 +586,181 @@ export class TradingRuntime {
       this.risk.halt(reason);
       await this.enterSafeModeFromMarketStream(event.symbol, reason, rootCorrelationId());
     }
+  }
+
+  private async evaluateSignals(event: RuntimeEvent): Promise<void> {
+    if (event.eventType !== "MARKET_TICK" && event.eventType !== "BOOK_UPDATE") {
+      return;
+    }
+    if (this.signals.listProviders().length === 0) {
+      return;
+    }
+
+    const signalEvents = await this.signals.evaluate(event, { nowMs: Date.now() });
+    for (const signalEvent of signalEvents) {
+      try {
+        await this.ingest(signalEvent);
+        this.metrics.signalsGenerated += 1;
+      } catch (error) {
+        this.metrics.signalsRejected += 1;
+        this.auditDecision({
+          action: "signal_rejected",
+          eventType: signalEvent.eventType,
+          correlationId: signalEvent.correlationId,
+          reason: error instanceof Error ? error.message : "signal_rejected"
+        });
+      }
+    }
+  }
+
+  private async evaluateSignalToIntentPolicy(event: RuntimeEvent): Promise<void> {
+    if (event.eventType !== "SIGNAL_CREATED") {
+      return;
+    }
+
+    if (!this.state.canSubmitOrders()) {
+      this.auditDecision({
+        action: "signal_intent_rejected",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        reason: "runtime_mode_disallows_signal_intent"
+      });
+      return;
+    }
+
+    const decision = await this.signalToIntentPolicy.evaluate(event, { nowMs: Date.now() });
+    if (!decision.allow) {
+      this.auditDecision({
+        action: "signal_intent_rejected",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        reason: decision.reason ?? "signal_to_intent_rejected"
+      });
+      return;
+    }
+
+    try {
+      await this.ingest(signalIntentDecisionToEventInput(this.signalToIntentPolicy, event, decision, { nowMs: Date.now() }));
+      this.auditDecision({
+        action: "signal_intent_generated",
+        seq: event.seq,
+        eventType: "INTENT_CREATED",
+        correlationId: event.correlationId
+      });
+    } catch (error) {
+      this.auditDecision({
+        action: "signal_intent_rejected",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        reason: error instanceof Error ? error.message : "signal_intent_rejected"
+      });
+    }
+  }
+
+  private async evaluatePaperFill(event: RuntimeEvent): Promise<void> {
+    if (!this.config.paperFillSimulationEnabled || event.eventType !== "ORDER_SUBMITTED") {
+      return;
+    }
+    if (!this.state.canSubmitOrders()) {
+      this.auditDecision({
+        action: "paper_fill_skipped",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        reason: "runtime_mode_disallows_paper_fill"
+      });
+      return;
+    }
+
+    const snapshot = this.marketSnapshots.get(event.symbol);
+    if (snapshot === undefined) {
+      this.auditDecision({
+        action: "paper_fill_skipped",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        reason: "missing_market_snapshot"
+      });
+      return;
+    }
+
+    const result = this.paperFillSimulator.simulate(
+      event,
+      snapshot,
+      () => {
+        this.seq += 1;
+        return this.seq;
+      },
+      Date.now()
+    );
+    if (result === undefined) {
+      return;
+    }
+
+    this.metrics.paperFillsGenerated += 1;
+    this.metrics.simulatedSlippageBps = result.slippageBps;
+    this.metrics.simulatedNotionalUsd += result.notionalUsd;
+    this.auditDecision({
+      action: "paper_fill_generated",
+      seq: result.event.seq,
+      eventType: result.event.eventType,
+      correlationId: result.event.correlationId,
+      metric: "paper_fill",
+      value: result.notionalUsd,
+      reason: "dry_run_simulated_fill"
+    });
+    await this.ingest({
+      seq: result.event.seq,
+      timestamp: result.event.timestamp,
+      receiveTimestamp: result.event.receiveTimestamp,
+      processingTimestamp: result.event.processingTimestamp ?? result.event.timestamp,
+      source: result.event.source,
+      symbol: result.event.symbol,
+      eventType: result.event.eventType,
+      correlationId: result.event.correlationId,
+      causationId: result.event.causationId,
+      payload: result.event.payload
+    });
+  }
+
+  private observeMarketSnapshot(event: RuntimeEvent): void {
+    if (event.eventType !== "MARKET_TICK" && event.eventType !== "BOOK_UPDATE") {
+      return;
+    }
+
+    const bid = Number(event.payload.bidPrice ?? event.payload.bid);
+    const ask = Number(event.payload.askPrice ?? event.payload.ask);
+    if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) {
+      return;
+    }
+    this.marketSnapshots.set(event.symbol, {
+      symbol: event.symbol,
+      bid,
+      ask,
+      timestamp: event.receiveTimestamp ?? event.timestamp
+    });
+  }
+
+  private observePaperPerformance(event: RuntimeEvent): void {
+    if (event.eventType !== "ORDER_FILLED" || event.payload.simulator !== "paper_fill") {
+      return;
+    }
+
+    const snapshot = this.paperPerformance.apply(event);
+    this.metrics.paperRealizedPnlUsd = snapshot.realizedPnlUsd;
+    this.metrics.paperUnrealizedPnlUsd = snapshot.unrealizedPnlUsd;
+    this.metrics.paperMaxDrawdownUsd = snapshot.maxDrawdownUsd;
+    this.metrics.paperWinRate = snapshot.winRate;
+    this.auditDecision({
+      action: "paper_performance_updated",
+      seq: event.seq,
+      eventType: event.eventType,
+      correlationId: event.correlationId,
+      metrics: snapshot as unknown as Record<string, unknown>
+    });
   }
 
   private toRuntimeEvent(input: EventInput): RuntimeEvent {
