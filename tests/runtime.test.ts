@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TradingRuntime } from "../src/runtime/runtime.js";
+import { TelegramNotifier, type AlertNotifier } from "../src/alerts/telegram-notifier.js";
 import { ConfigSchema, RUNTIME_PROFILE_LIMITS, type RuntimeConfig, type RuntimeProfile } from "../src/infra/config.js";
 import { createLogger } from "../src/infra/logger.js";
 import { RuntimeEventSchema, type EventInput, type RuntimeEvent } from "../src/core/event.js";
@@ -44,6 +45,14 @@ class MemoryAuditLog {
 
   entries(action: string): AuditEntry[] {
     return this.records.filter((record): record is AuditEntry => "action" in record && record.action === action);
+  }
+}
+
+class MemoryNotifier implements AlertNotifier {
+  readonly messages: string[] = [];
+
+  async sendAlert(message: string): Promise<void> {
+    this.messages.push(message);
   }
 }
 
@@ -96,6 +105,9 @@ const baseConfig: RuntimeConfig = {
   idempotencyCacheSize: 100,
   paperFillSimulationEnabled: false,
   paperFillSlippageBps: 0,
+  telegramAlertsEnabled: false,
+  telegramBotToken: "",
+  telegramChatId: "",
   binanceFuturesWsUrl: "wss://fstream.binance.com",
   binanceApiKey: "",
   binanceApiSecret: ""
@@ -197,6 +209,48 @@ test("invalid config fails startup closed", () => {
       eventStore: new MemoryEventStore()
     });
   }, /Too small|Number must be greater than 0/);
+});
+
+test("Telegram alerts fail closed when explicitly enabled without config", () => {
+  assert.throws(
+    () =>
+      ConfigSchema.parse({
+        telegramAlertsEnabled: true,
+        telegramBotToken: "",
+        telegramChatId: "123"
+      }),
+    /telegram_bot_token_required/
+  );
+  assert.throws(
+    () =>
+      ConfigSchema.parse({
+        telegramAlertsEnabled: true,
+        telegramBotToken: "token",
+        telegramChatId: ""
+      }),
+    /telegram_chat_id_required/
+  );
+});
+
+test("TelegramNotifier sends alerts with mocked fetch", async () => {
+  const calls: Array<{ url: string; body: string }> = [];
+  const notifier = new TelegramNotifier(
+    { telegramAlertsEnabled: true, telegramBotToken: "test_token", telegramChatId: "chat_1" },
+    async (url, init) => {
+      calls.push({ url, body: init.body });
+      return { ok: true, status: 200, text: async () => "ok" };
+    }
+  );
+
+  await notifier.sendAlert("runtime started");
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.url, "https://api.telegram.org/bottest_token/sendMessage");
+  assert.deepEqual(JSON.parse(calls[0]?.body ?? "{}"), {
+    chat_id: "chat_1",
+    text: "runtime started",
+    disable_web_page_preview: true
+  });
 });
 
 test("each runtime profile loads expected limits", async () => {
@@ -894,6 +948,53 @@ test("audit logs DRY_RUN order simulation", async () => {
   assert.equal(dryRun[0]?.correlationId, "corr_audit_order");
 
   await runtime.stop();
+});
+
+test("runtime sends Telegram alerts through notifier integration", async () => {
+  const config = { ...baseConfig, paperFillSimulationEnabled: true };
+  const notifier = new MemoryNotifier();
+  const eventStore = new MemoryEventStore();
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, notifier });
+
+  await runtime.start();
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_alerts",
+    causationId: "market",
+    payload: { bid: 100, ask: 101 }
+  });
+  await runtime.ingest({
+    source: "test",
+    symbol: "BTCUSDT",
+    eventType: "INTENT_CREATED",
+    correlationId: "corr_alerts",
+    causationId: "signal_alerts",
+    payload: { side: "BUY", type: "MARKET", quantity: 1, topOfBookQuantity: 10 }
+  });
+  await runtime.handleMarketStreamLifecycle({
+    action: "reconnecting",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+  await runtime.handleMarketStreamLifecycle({
+    action: "disconnected",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+  await runtime.stop();
+
+  assert.equal(notifier.messages.some((message) => message.includes("TradingRuntime started")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("DRY_RUN ORDER_SUBMITTED")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("Simulated ORDER_FILLED")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("Paper PnL updated")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("Websocket reconnecting")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("Websocket disconnected")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("SAFE_MODE entered")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("TradingRuntime stopped")), true);
 });
 
 test("generated ORDER_SUBMITTED is persisted and audited", async () => {

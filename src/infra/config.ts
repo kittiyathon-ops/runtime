@@ -100,6 +100,9 @@ const RawConfigSchema = z.object({
   idempotencyCacheSize: z.coerce.number().int().positive().optional(),
   paperFillSimulationEnabled: z.boolean().default(false),
   paperFillSlippageBps: z.coerce.number().nonnegative().default(0),
+  telegramAlertsEnabled: z.boolean().default(false),
+  telegramBotToken: z.string().default(""),
+  telegramChatId: z.string().default(""),
   binanceFuturesWsUrl: z.string().url().default("wss://fstream.binance.com"),
   binanceApiKey: z.string().default(""),
   binanceApiSecret: z.string().default("")
@@ -127,10 +130,29 @@ export const ConfigSchema = RawConfigSchema.transform((config) => {
   sqlitePath: z.string(),
   paperFillSimulationEnabled: z.boolean(),
   paperFillSlippageBps: z.number().nonnegative(),
+  telegramAlertsEnabled: z.boolean(),
+  telegramBotToken: z.string(),
+  telegramChatId: z.string(),
   binanceFuturesWsUrl: z.string().url(),
   binanceApiKey: z.string(),
   binanceApiSecret: z.string(),
   ...ResolvedRuntimeLimitsSchema.shape
+}).superRefine((config, ctx) => {
+  if (!config.telegramAlertsEnabled) return;
+  if (config.telegramBotToken.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["telegramBotToken"],
+      message: "telegram_bot_token_required"
+    });
+  }
+  if (config.telegramChatId.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["telegramChatId"],
+      message: "telegram_chat_id_required"
+    });
+  }
 }));
 
 export type RuntimeConfig = z.infer<typeof ConfigSchema>;
@@ -154,6 +176,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     idempotencyCacheSize: env.IDEMPOTENCY_CACHE_SIZE,
     paperFillSimulationEnabled: env.PAPER_FILL_SIMULATION_ENABLED === "true",
     paperFillSlippageBps: env.PAPER_FILL_SLIPPAGE_BPS,
+    telegramAlertsEnabled: env.TELEGRAM_ALERTS_ENABLED === "true",
+    telegramBotToken: env.TELEGRAM_BOT_TOKEN,
+    telegramChatId: env.TELEGRAM_CHAT_ID,
     binanceFuturesWsUrl: env.BINANCE_FUTURES_WS_URL,
     binanceApiKey: env.BINANCE_API_KEY,
     binanceApiSecret: env.BINANCE_API_SECRET

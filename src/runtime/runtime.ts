@@ -1,4 +1,5 @@
 import { AuditLog, type AuditEntry, type AuditSink } from "../audit/audit-log.js";
+import { NoopNotifier, TelegramNotifier, type AlertNotifier } from "../alerts/telegram-notifier.js";
 import {
   BinanceMarketStream,
   normalizeBinanceMarketPayload,
@@ -47,6 +48,9 @@ type RuntimeRiskConfig = Pick<
   | "idempotencyCacheSize"
   | "paperFillSimulationEnabled"
   | "paperFillSlippageBps"
+  | "telegramAlertsEnabled"
+  | "telegramBotToken"
+  | "telegramChatId"
   | "binanceFuturesWsUrl"
 >;
 
@@ -61,6 +65,7 @@ type RuntimeDeps = {
   replay?: ReplayEngine;
   risk?: RiskEngine;
   signals?: SignalEngine;
+  notifier?: AlertNotifier;
   shutdown?: ShutdownController;
 };
 
@@ -176,6 +181,8 @@ export class TradingRuntime {
 
   private readonly logger: Logger;
 
+  private readonly notifier: AlertNotifier;
+
   private readonly marketStreams: BinanceMarketStream[] = [];
 
   private shutdownStarted = false;
@@ -245,6 +252,7 @@ export class TradingRuntime {
     this.events = deps?.eventBus ?? new AsyncEventBus(this.config.eventQueueCapacity);
     this.eventStore = deps?.eventStore ?? new SqliteEventStore(this.config.sqlitePath);
     this.audit = deps?.audit ?? new AuditLog(this.logger);
+    this.notifier = deps?.notifier ?? (this.config.telegramAlertsEnabled ? new TelegramNotifier(this.config) : new NoopNotifier());
     this.seenSeq = new BoundedIdSet<number>(this.config.idempotencyCacheSize);
     this.seenEventIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.submittedOrderKeys = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
@@ -980,6 +988,52 @@ export class TradingRuntime {
       this.metrics.safeModeCount += 1;
     }
     this.audit.record(entry);
+    this.alertForAuditEntry(entry);
+  }
+
+  private alertForAuditEntry(entry: AuditEntry): void {
+    const message = this.alertMessage(entry);
+    if (message === undefined) return;
+    void this.notifier.sendAlert(message).catch((error) => {
+      this.audit.record({
+        action: "telegram_alert_failed",
+        reason: error instanceof Error ? error.message : "telegram_alert_failed"
+      });
+    });
+  }
+
+  private alertMessage(entry: AuditEntry): string | undefined {
+    if (entry.action === "runtime_started") {
+      return `TradingRuntime started profile=${entry.runtimeProfile ?? "unknown"}`;
+    }
+    if (entry.action === "runtime_stopped") {
+      return "TradingRuntime stopped";
+    }
+    if (entry.action === "safe_mode_entered") {
+      return `SAFE_MODE entered reason=${entry.reason ?? "unknown"} correlation=${entry.correlationId ?? "n/a"}`;
+    }
+    if (entry.action === "dry_run_order_submitted_generated") {
+      return `DRY_RUN ORDER_SUBMITTED correlation=${entry.correlationId ?? "n/a"} seq=${entry.seq ?? "n/a"}`;
+    }
+    if (entry.action === "paper_fill_generated") {
+      return `Simulated ORDER_FILLED notional=${entry.value ?? "n/a"} correlation=${entry.correlationId ?? "n/a"}`;
+    }
+    if (entry.action === "event_rejected") {
+      return `Runtime event rejected reason=${entry.reason ?? "unknown"} correlation=${entry.correlationId ?? "n/a"}`;
+    }
+    if (entry.action === "market_stream_disconnected") {
+      return `Websocket disconnected symbol=${entry.symbol ?? "n/a"} reason=${entry.reason ?? "unknown"}`;
+    }
+    if (entry.action === "market_stream_reconnecting") {
+      return `Websocket reconnecting symbol=${entry.symbol ?? "n/a"} reason=${entry.reason ?? "unknown"}`;
+    }
+    if (entry.action === "paper_performance_updated") {
+      const realized = entry.metrics?.realizedPnlUsd;
+      const unrealized = entry.metrics?.unrealizedPnlUsd;
+      const drawdown = entry.metrics?.maxDrawdownUsd;
+      return `Paper PnL updated realized=${String(realized ?? "n/a")} unrealized=${String(unrealized ?? "n/a")} maxDrawdown=${String(drawdown ?? "n/a")}`;
+    }
+    return undefined;
   }
 
   private auditMetricBreach(metric: string, value: number, threshold: number, reason: string): void {
