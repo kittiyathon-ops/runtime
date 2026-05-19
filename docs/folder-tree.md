@@ -1,0 +1,58 @@
+# Final Folder Tree
+
+```text
+trading-runtime/
+  docs/
+    dependency-graph.md
+    folder-tree.md
+    runtime-architecture.md
+    runtime-state-machine.md
+  specs/
+    master-spec.md
+    001-runtime-core.md
+  src/
+    adapters/
+      binance.ts
+    audit/
+      audit-log.ts
+    core/
+      clock.ts
+      errors.ts
+      event.ts
+      ids.ts
+      sequence.ts
+      time.ts
+    execution/
+      execution-engine.ts
+      order.ts
+      slippage.ts
+    infra/
+      bounded-queue.ts
+      config.ts
+      event-bus.ts
+      event-store.ts
+      logger.ts
+      shutdown.ts
+      sqlite-event-store.ts
+    portfolio/
+      portfolio-state.ts
+    replay/
+      replay-engine.ts
+    risk/
+      risk-engine.ts
+    runtime/
+      checkpoint.ts
+      runtime.ts
+      state-machine.ts
+    types/
+      better-sqlite3.d.ts
+      ws.d.ts
+    index.ts
+  tests/
+    runtime.test.ts
+  .env.example
+  package.json
+  pnpm-lock.yaml
+  pnpm-workspace.yaml
+  tsconfig.json
+```
