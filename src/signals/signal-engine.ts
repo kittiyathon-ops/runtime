@@ -33,11 +33,47 @@ export interface SignalToIntentPolicy {
   evaluate(signal: RuntimeEvent, context: SignalContext): SignalToIntentDecision | Promise<SignalToIntentDecision>;
 }
 
+export interface DeterministicSignalStrategy extends SignalToIntentPolicy {
+  evaluateMarketEvent(event: RuntimeEvent, context: SignalContext): SignalCandidate[] | Promise<SignalCandidate[]>;
+}
+
 export class RejectAllSignalToIntentPolicy implements SignalToIntentPolicy {
   readonly id = "reject_all_signal_to_intent";
 
   evaluate(): SignalToIntentDecision {
     return { allow: false, reason: "signal_to_intent_disabled" };
+  }
+}
+
+export class CompositeSignalToIntentPolicy implements SignalToIntentPolicy {
+  readonly id = "composite_signal_to_intent";
+
+  private readonly strategies: DeterministicSignalStrategy[] = [];
+
+  register(strategy: DeterministicSignalStrategy): void {
+    if (this.strategies.some((registered) => registered.id === strategy.id)) {
+      throw new Error(`signal_strategy_duplicate:${strategy.id}`);
+    }
+    this.strategies.push(strategy);
+  }
+
+  listStrategies(): readonly DeterministicSignalStrategy[] {
+    return this.strategies;
+  }
+
+  async evaluate(signal: RuntimeEvent, context: SignalContext): Promise<SignalToIntentDecision> {
+    const strategyId = signal.payload.strategyId;
+    if (typeof strategyId === "string") {
+      const strategy = this.strategies.find((candidate) => candidate.id === strategyId);
+      if (strategy === undefined) return { allow: false, reason: `signal_strategy_not_registered:${strategyId}` };
+      return strategy.evaluate(signal, context);
+    }
+
+    for (const strategy of this.strategies) {
+      const decision = await strategy.evaluate(signal, context);
+      if (decision.allow) return decision;
+    }
+    return { allow: false, reason: "signal_strategy_not_matched" };
   }
 }
 
@@ -76,6 +112,10 @@ export class SignalEngine {
       throw new Error(`signal_provider_duplicate:${provider.id}`);
     }
     this.providers.push(provider);
+  }
+
+  registerStrategy(strategy: DeterministicSignalStrategy): void {
+    this.register(new StrategySignalProvider(strategy));
   }
 
   listProviders(): readonly SignalProvider[] {
@@ -117,6 +157,19 @@ export class SignalEngine {
         ...candidate.payload
       }
     };
+  }
+}
+
+class StrategySignalProvider implements SignalProvider {
+  readonly id: string;
+
+  constructor(private readonly strategy: DeterministicSignalStrategy) {
+    this.id = strategy.id;
+  }
+
+  evaluate(event: RuntimeEvent, context: SignalContext): SignalCandidate[] | Promise<SignalCandidate[]> {
+    if (event.eventType !== "MARKET_TICK") return [];
+    return this.strategy.evaluateMarketEvent(event, context);
   }
 }
 

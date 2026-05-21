@@ -95,6 +95,7 @@ export function normalizeBinanceMarketPayload(
 
   if (stream === "trade") {
     const tradeTime = optionalTimestamp(payload, "T");
+    const quantity = requireNumberLike(payload, "q");
     return {
       eventId: eventIdFor(stream, normalizedSymbol, payload),
       timestamp: receiveTimestamp,
@@ -110,7 +111,8 @@ export function normalizeBinanceMarketPayload(
         stream,
         tradeId: requireNumberLike(payload, "t"),
         price: requireNumberLike(payload, "p"),
-        quantity: requireNumberLike(payload, "q"),
+        quantity,
+        volume: quantity,
         buyerIsMaker: payload.m === true
       }
     };
@@ -145,7 +147,7 @@ export class BinanceMarketStream {
   private readonly staleTimers = new Set<NodeJS.Timeout>();
 
   constructor(
-    private readonly config: Pick<RuntimeConfig, "binanceFuturesWsUrl" | "staleDataHaltMs">,
+    private readonly config: Pick<RuntimeConfig, "binanceFuturesMarketWsBaseUrl" | "staleDataHaltMs">,
     private readonly clock: Clock,
     private readonly logger: Logger,
     private readonly sink: NormalizedEventSink,
@@ -167,7 +169,7 @@ export class BinanceMarketStream {
 
   connect(symbol: string, stream: BinanceMarketStreamKind): void {
     const streamName = this.toStreamName(symbol, stream);
-    const url = `${this.config.binanceFuturesWsUrl}/ws/${streamName}`;
+    const url = `${this.config.binanceFuturesMarketWsBaseUrl.replace(/\/+$/, "")}/${this.routeForStream(stream)}/ws/${streamName}`;
     let lastMessageAt = this.clock.nowMs();
     const socket = this.websocketFactory(url);
     this.sockets.push(socket);
@@ -232,5 +234,9 @@ export class BinanceMarketStream {
     if (stream === "bookTicker") return `${normalizedSymbol}@bookTicker`;
     if (stream === "trade") return `${normalizedSymbol}@trade`;
     return `${normalizedSymbol}@markPrice@1s`;
+  }
+
+  private routeForStream(stream: BinanceMarketStreamKind): "public" | "market" {
+    return stream === "markPrice" ? "market" : "public";
   }
 }

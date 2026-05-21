@@ -2,8 +2,13 @@ node_modules/
 dist/
 coverage/
 .env
+.env.local
+.env.production
 *.log
+*.local.ps1
 checkpoints/
 replays/
 .sqlite
+*.sqlite
+data/*.sqlite
 *.db

@@ -8,7 +8,7 @@ import {
 } from "../adapters/binance.js";
 import type { EventInput, RuntimeEvent } from "../core/event.js";
 import { RuntimeEventSchema } from "../core/event.js";
-import { SystemClock } from "../core/clock.js";
+import { SystemClock, type Clock } from "../core/clock.js";
 import { rootCorrelationId } from "../core/ids.js";
 import { ExecutionEngine } from "../execution/execution-engine.js";
 import { PaperFillSimulator, type MarketSnapshot } from "../execution/paper-fill-simulator.js";
@@ -19,13 +19,22 @@ import type { EventStore } from "../infra/event-store.js";
 import { createLogger, type Logger } from "../infra/logger.js";
 import { ShutdownController } from "../infra/shutdown.js";
 import { SqliteEventStore } from "../infra/sqlite-event-store.js";
+import {
+  BinanceLiveExecution,
+  type BinanceLiveExecutionLifecycleEvent,
+  type LiveExecutionSurvivabilitySnapshot
+} from "../live-execution/binance-live-execution.js";
+import { buildTelegramAlert } from "../notifications/telegram-alert-builder.js";
+import type { TelegramAlertPayload } from "../notifications/telegram-message-types.js";
 import { PortfolioState } from "../portfolio/portfolio-state.js";
 import { ReplayEngine, type ReplayMismatch } from "../replay/replay-engine.js";
 import { RiskEngine, type RiskDecision, type RiskState } from "../risk/risk-engine.js";
 import {
+  CompositeSignalToIntentPolicy,
   RejectAllSignalToIntentPolicy,
   SignalEngine,
   signalIntentDecisionToEventInput,
+  type DeterministicSignalStrategy,
   type SignalProvider,
   type SignalToIntentPolicy
 } from "../signals/signal-engine.js";
@@ -51,7 +60,23 @@ type RuntimeRiskConfig = Pick<
   | "telegramAlertsEnabled"
   | "telegramBotToken"
   | "telegramChatId"
-  | "binanceFuturesWsUrl"
+  | "telegramLanguage"
+  | "telegramAlertMode"
+  | "dryRun"
+  | "killSwitch"
+  | "liveTradingConfirmation"
+  | "allowMarketOrders"
+  | "binanceSymbols"
+  | "binanceUseTestnet"
+  | "binanceFuturesRestUrl"
+  | "binanceFuturesUserStreamBaseUrl"
+  | "binanceFuturesMarketWsBaseUrl"
+  | "binanceFuturesWsApiUrl"
+  | "maxOrderNotionalUsd"
+  | "maxDailyLossUsd"
+  | "maxLeverage"
+  | "binanceApiKey"
+  | "binanceApiSecret"
 >;
 
 type RuntimeDeps = {
@@ -67,6 +92,8 @@ type RuntimeDeps = {
   signals?: SignalEngine;
   notifier?: AlertNotifier;
   shutdown?: ShutdownController;
+  clock?: Clock;
+  liveExecution?: BinanceLiveExecution;
 };
 
 export interface IngestOptions {
@@ -88,6 +115,9 @@ interface RuntimeMetrics {
   replayThroughputEventsPerSecond: number;
   safeModeCount: number;
   websocketReconnectCount: number;
+  liveExecutionReconnectCount: number;
+  orphanFillsDetected: number;
+  liveExecutionDegraded: boolean;
   signalsGenerated: number;
   signalsRejected: number;
   paperFillsGenerated: number;
@@ -114,6 +144,9 @@ export interface RuntimeHealth {
   replayThroughputEventsPerSecond: number;
   safeModeCount: number;
   websocketReconnectCount: number;
+  liveExecutionReconnectCount: number;
+  orphanFillsDetected: number;
+  liveExecutionDegraded: boolean;
   signalsGenerated: number;
   signalsRejected: number;
   paperFillsGenerated: number;
@@ -183,6 +216,14 @@ export class TradingRuntime {
 
   private readonly notifier: AlertNotifier;
 
+  private readonly clock: Clock;
+
+  private readonly alertSentAtByKey = new Map<string, number>();
+
+  private static readonly ALERT_DEDUPE_WINDOW_MS = 60_000;
+
+  private static readonly PERSISTED_SEQ_SCAN_BATCH_SIZE = 10_000;
+
   private readonly marketStreams: BinanceMarketStream[] = [];
 
   private shutdownStarted = false;
@@ -197,13 +238,19 @@ export class TradingRuntime {
 
   private readonly submittedOrderKeys: BoundedIdSet<string>;
 
+  private readonly liveOrderIds: BoundedIdSet<string>;
+
   private readonly expectedPositions = new Map<string, number>();
+
+  private readonly strategySignalToIntentPolicy = new CompositeSignalToIntentPolicy();
 
   private signalToIntentPolicy: SignalToIntentPolicy = new RejectAllSignalToIntentPolicy();
 
   private readonly marketSnapshots = new Map<string, MarketSnapshot>();
 
   private readonly paperFillSimulator: PaperFillSimulator;
+
+  private readonly liveExecution: BinanceLiveExecution;
 
   private readonly paperPerformance = new PaperPerformanceTracker();
 
@@ -217,6 +264,9 @@ export class TradingRuntime {
     replayThroughputEventsPerSecond: 0,
     safeModeCount: 0,
     websocketReconnectCount: 0,
+    liveExecutionReconnectCount: 0,
+    orphanFillsDetected: 0,
+    liveExecutionDegraded: false,
     signalsGenerated: 0,
     signalsRejected: 0,
     paperFillsGenerated: 0,
@@ -253,19 +303,27 @@ export class TradingRuntime {
     this.eventStore = deps?.eventStore ?? new SqliteEventStore(this.config.sqlitePath);
     this.audit = deps?.audit ?? new AuditLog(this.logger);
     this.notifier = deps?.notifier ?? (this.config.telegramAlertsEnabled ? new TelegramNotifier(this.config) : new NoopNotifier());
+    this.clock = deps?.clock ?? new SystemClock();
     this.seenSeq = new BoundedIdSet<number>(this.config.idempotencyCacheSize);
     this.seenEventIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.submittedOrderKeys = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
+    this.liveOrderIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.portfolio = deps?.portfolio ?? new PortfolioState();
     this.replay = deps?.replay ?? new ReplayEngine();
     this.risk = deps?.risk ?? new RiskEngine(this.config, this.portfolio);
     this.signals = deps?.signals ?? new SignalEngine();
     this.execution = deps?.execution ?? new ExecutionEngine(this.risk);
     this.paperFillSimulator = new PaperFillSimulator(this.config.paperFillSlippageBps);
+    this.liveExecution = deps?.liveExecution ?? new BinanceLiveExecution(
+      (event) => this.ingestBinanceLiveExecutionEvent(event),
+      (event) => this.handleLiveExecutionLifecycle(event),
+      { config: this.config }
+    );
     this.shutdown = deps?.shutdown ?? new ShutdownController();
     this.shutdown.onShutdown(async () => {
       await this.waitForIngestIdle();
       await this.events.drain();
+      this.flushEventStore();
       this.eventStore.close();
       if (this.state.mode() !== "HALTED") {
         this.state.transition("HALTED");
@@ -278,6 +336,7 @@ export class TradingRuntime {
       return;
     }
 
+    this.restorePersistedSequenceState();
     this.running = true;
     this.auditDecision({
       action: "runtime_started",
@@ -289,7 +348,7 @@ export class TradingRuntime {
     }, TradingRuntime.HEALTH_REPORT_INTERVAL_MS);
     this.timer.unref?.();
 
-    console.log("runtime.start()");
+    console.log(`runtime.start() profile=${this.config.runtimeProfile} dryRun=${this.config.dryRun} killSwitch=${this.config.killSwitch}`);
   }
 
   async stop(): Promise<void> {
@@ -300,6 +359,7 @@ export class TradingRuntime {
       stream.close();
     }
     this.marketStreams.length = 0;
+    this.liveExecution.close();
 
     if (this.timer) {
       clearInterval(this.timer);
@@ -316,13 +376,13 @@ export class TradingRuntime {
   }
 
   async ingest(input: EventInput, options: IngestOptions = {}): Promise<void> {
-    if (this.shutdownStarted || this.state.mode() === "STOPPING" || this.state.mode() === "HALTED") {
+    if (this.shutdownStarted || this.state.mode() === "STOPPING" || this.state.mode() === "HALTED" || this.state.mode() === "GOVERNANCE_HALT") {
       this.auditDecision({ action: "event_rejected", reason: "runtime_shutdown" });
       throw new Error("runtime_shutdown");
     }
     this.assertQueueDepthAllowsIngest(input);
 
-    const startedAt = Date.now();
+    const startedAt = this.clock.monotonicMs();
     let event: RuntimeEvent | undefined;
     this.activeIngests += 1;
     try {
@@ -331,7 +391,7 @@ export class TradingRuntime {
       this.activeIngests -= 1;
       this.resolveIngestIdleIfDrained();
     }
-    await this.observeProcessingLatency(Date.now() - startedAt, event);
+    await this.observeProcessingLatency(this.clock.monotonicMs() - startedAt, event);
   }
 
   private async ingestAccepted(input: EventInput, options: IngestOptions): Promise<RuntimeEvent> {
@@ -363,7 +423,7 @@ export class TradingRuntime {
         this.auditDuplicateRejection(event, error instanceof Error ? error.message : "duplicate_order_intent");
         throw error;
       }
-      const decision = this.risk.evaluateIntent(event, Date.now());
+      const decision = this.risk.evaluateIntent(event, this.clock.nowMs());
       if (!decision.allow) {
         await this.enterSafeMode(event, decision.reason ?? "kill_switch");
         this.saveCheckpoint();
@@ -378,6 +438,11 @@ export class TradingRuntime {
       }
     } else {
       await this.publishAccepted(event, { bypassDuplicateChecks, checked: true });
+      await this.observeAcceptedOrderSubmission(event);
+      if (await this.failClosedOnOrphanFill(event)) {
+        this.saveCheckpoint();
+        return event;
+      }
       this.observeMarketSnapshot(event);
       this.portfolio.apply(event);
       this.observePaperPerformance(event);
@@ -415,24 +480,26 @@ export class TradingRuntime {
           this.seq += 1;
           return this.seq;
         },
-        Date.now()
+        this.clock.nowMs()
       );
       if (!result.accepted && result.events.length === 0) {
         this.saveCheckpoint();
         return event;
       }
       for (const producedEvent of result.events) {
-        if (producedEvent.eventType === "ORDER_SUBMITTED") {
+        const acceptedProducedEvent = this.withLiveExecutionMetadata(event, producedEvent);
+        if (acceptedProducedEvent.eventType === "ORDER_SUBMITTED") {
           this.auditDecision({
             action: "dry_run_order_submitted_generated",
-            seq: producedEvent.seq,
-            eventType: producedEvent.eventType,
-            correlationId: producedEvent.correlationId
+            seq: acceptedProducedEvent.seq,
+            eventType: acceptedProducedEvent.eventType,
+            correlationId: acceptedProducedEvent.correlationId
           });
         }
-        await this.publishAccepted(producedEvent);
-        this.risk.observe(producedEvent);
-        await this.evaluatePaperFill(producedEvent);
+        await this.publishAccepted(acceptedProducedEvent);
+        await this.observeAcceptedOrderSubmission(acceptedProducedEvent);
+        this.risk.observe(acceptedProducedEvent);
+        await this.evaluatePaperFill(acceptedProducedEvent);
       }
       if (result.events.some((producedEvent) => producedEvent.eventType === "ORDER_SUBMITTED")) {
         this.submittedOrderKeys.add(this.orderSubmissionKey(event));
@@ -450,9 +517,9 @@ export class TradingRuntime {
       if (previousMode !== "REPLAY") {
         this.state.transition("REPLAY");
       }
-      const startedAt = Date.now();
+      const startedAt = this.clock.monotonicMs();
       const events = this.eventStore.readFrom(fromSeq, limit);
-      this.observeReplayThroughput(events.length, Date.now() - startedAt);
+      this.observeReplayThroughput(events.length, this.clock.monotonicMs() - startedAt);
       this.observeReplayLag(events.length);
       const mismatches = this.replay.verify(events);
       if (mismatches.length > 0) {
@@ -483,8 +550,39 @@ export class TradingRuntime {
     this.state.transition(mode);
   }
 
+  governanceHalt(reason: string, evidenceIds: readonly string[] = ["governance_halt"]): void {
+    if (reason.length === 0) throw new Error("governance_halt_reason_required");
+    if (evidenceIds.length === 0) throw new Error("governance_halt_requires_evidence");
+    this.risk.halt(reason);
+    this.state.transition("GOVERNANCE_HALT");
+    this.auditDecision({
+      action: "governance_halt_entered",
+      reason,
+      metrics: { evidenceIds: [...evidenceIds] }
+    });
+  }
+
+  hibernate(reason: string, evidenceIds: readonly string[] = ["runtime_hibernation"]): void {
+    if (reason.length === 0) throw new Error("hibernation_reason_required");
+    if (evidenceIds.length === 0) throw new Error("hibernation_requires_evidence");
+    if (this.state.mode() !== "HIBERNATION_MODE") {
+      this.state.transition("HIBERNATION_MODE");
+    }
+    this.auditDecision({
+      action: "hibernation_mode_entered",
+      reason,
+      metrics: { evidenceIds: [...evidenceIds] }
+    });
+  }
+
   registerSignalProvider(provider: SignalProvider): void {
     this.signals.register(provider);
+  }
+
+  registerSignalStrategy(strategy: DeterministicSignalStrategy): void {
+    this.signals.registerStrategy(strategy);
+    this.strategySignalToIntentPolicy.register(strategy);
+    this.signalToIntentPolicy = this.strategySignalToIntentPolicy;
   }
 
   registerSignalToIntentPolicy(policy: SignalToIntentPolicy): void {
@@ -509,6 +607,9 @@ export class TradingRuntime {
       replayThroughputEventsPerSecond: this.metrics.replayThroughputEventsPerSecond,
       safeModeCount: this.metrics.safeModeCount,
       websocketReconnectCount: this.metrics.websocketReconnectCount,
+      liveExecutionReconnectCount: this.metrics.liveExecutionReconnectCount,
+      orphanFillsDetected: this.metrics.orphanFillsDetected,
+      liveExecutionDegraded: this.metrics.liveExecutionDegraded,
       signalsGenerated: this.metrics.signalsGenerated,
       signalsRejected: this.metrics.signalsRejected,
       paperFillsGenerated: this.metrics.paperFillsGenerated,
@@ -526,9 +627,11 @@ export class TradingRuntime {
   }
 
   connectBinanceMarketData(symbol: string): void {
+    // TODO(runtime-boundary): move this Binance-specific compatibility bridge into adapter orchestration.
+    // TradingRuntime should eventually depend only on RuntimeMarketDataAdapter and canonical EventInput.
     const stream = new BinanceMarketStream(
       this.config,
-      new SystemClock(),
+      this.clock,
       this.logger,
       (event) => this.ingestExternalMarketEvent(event),
       (event) => this.handleMarketStreamLifecycle(event)
@@ -539,14 +642,43 @@ export class TradingRuntime {
     this.marketStreams.push(stream);
   }
 
+  async connectBinanceUserStream(symbols: readonly string[]): Promise<void> {
+    const snapshot = await this.refreshLiveExecutionSurvivabilitySnapshot(symbols, ["connect_user_stream_survivability_snapshot"]);
+    if (snapshot.status !== "LIVE_EXECUTION_SURVIVABILITY_SNAPSHOT_READY") {
+      throw new Error(`live_execution_survivability_snapshot_degraded:${snapshot.failures.join(",")}`);
+    }
+    await this.liveExecution.connectUserStream(symbols);
+  }
+
+  async refreshLiveExecutionSurvivabilitySnapshot(symbols: readonly string[] = this.config.binanceSymbols, evidenceIds: readonly string[] = ["runtime_live_execution_survivability_snapshot"]): Promise<LiveExecutionSurvivabilitySnapshot> {
+    const snapshot = await this.liveExecution.refreshSurvivabilitySnapshot(symbols, evidenceIds);
+    this.metrics.liveExecutionDegraded = snapshot.status !== "LIVE_EXECUTION_SURVIVABILITY_SNAPSHOT_READY";
+    this.auditDecision({
+      action: "live_execution_survivability_snapshot_refreshed",
+      reason: snapshot.status,
+      metrics: {
+        symbols: [...snapshot.symbols],
+        failures: [...snapshot.failures],
+        evidenceIds: [...snapshot.evidenceIds]
+      }
+    });
+    return snapshot;
+  }
+
+  async fetchStartupExchangeTruth(evidenceIds: readonly string[] = ["runtime_startup_exchange_truth"]) {
+    return this.liveExecution.fetchStartupExchangeTruth(evidenceIds);
+  }
+
   async ingestBinanceMarketPayload(
     stream: BinanceMarketStreamKind,
     symbol: string,
     payload: Record<string, unknown>,
-    receiveTimestamp = Date.now()
+    receiveTimestamp?: number
   ): Promise<void> {
+    // TODO(runtime-boundary): keep raw exchange payload normalization outside TradingRuntime.
+    // This method remains as a test/integration compatibility seam while adapters are being extracted.
     try {
-      await this.ingestExternalMarketEvent(normalizeBinanceMarketPayload(stream, symbol, payload, receiveTimestamp));
+      await this.ingestExternalMarketEvent(normalizeBinanceMarketPayload(stream, symbol, payload, receiveTimestamp ?? this.clock.nowMs()));
     } catch (error) {
       const reason = error instanceof Error ? error.message : "malformed_exchange_payload";
       if (reason.startsWith("malformed_exchange_payload")) {
@@ -564,6 +696,58 @@ export class TradingRuntime {
       throw new Error("external_market_event_type_invalid");
     }
     await this.ingest(input);
+  }
+
+  async ingestBinanceLiveExecutionEvent(input: EventInput): Promise<void> {
+    if (input.source !== "binance_user_ws") {
+      throw new Error("live_execution_event_source_invalid");
+    }
+    if (
+      input.eventType !== "ORDER_ACCEPTED" &&
+      input.eventType !== "ORDER_FILLED" &&
+      input.eventType !== "ORDER_REJECTED" &&
+      input.eventType !== "EXECUTION_ERROR" &&
+      input.eventType !== "POSITION_UPDATED"
+    ) {
+      throw new Error("live_execution_event_type_invalid");
+    }
+    await this.ingest(input);
+  }
+
+  async handleLiveExecutionLifecycle(event: BinanceLiveExecutionLifecycleEvent): Promise<void> {
+    if (event.action === "reconnecting") {
+      this.metrics.liveExecutionReconnectCount += 1;
+    }
+    this.metrics.liveExecutionDegraded = event.action === "partitioned" || event.action === "reconnecting";
+    this.auditDecision({
+      action: `live_execution_${event.action}`,
+      ...(event.symbol === undefined ? {} : { symbol: event.symbol }),
+      reason: event.reason ?? event.action
+    });
+
+    if (event.action === "fatal_shutdown") {
+      this.auditDecision({
+        action: "live_execution_fatal_shutdown",
+        ...(event.symbol === undefined ? {} : { symbol: event.symbol }),
+        reason: event.reason ?? "fatal_exchange_auth_state"
+      });
+      this.governanceHalt(event.reason ?? "fatal_exchange_auth_state", ["live_execution_fatal_shutdown"]);
+      return;
+    }
+
+    if (event.action === "partitioned") {
+      this.risk.halt("live_execution_websocket_partition");
+      await this.enterSafeModeFromMarketStream(event.symbol ?? "UNKNOWN", "live_execution_websocket_partition", rootCorrelationId());
+      return;
+    }
+
+    if (event.action === "recovered") {
+      this.auditDecision({
+        action: "live_execution_reconciliation_recommended",
+        ...(event.symbol === undefined ? {} : { symbol: event.symbol }),
+        reason: "websocket_reconnect_recovery"
+      });
+    }
   }
 
   async handleMarketStreamLifecycle(event: {
@@ -604,7 +788,7 @@ export class TradingRuntime {
       return;
     }
 
-    const signalEvents = await this.signals.evaluate(event, { nowMs: Date.now() });
+    const signalEvents = await this.signals.evaluate(event, { nowMs: this.clock.nowMs() });
     for (const signalEvent of signalEvents) {
       try {
         await this.ingest(signalEvent);
@@ -637,7 +821,7 @@ export class TradingRuntime {
       return;
     }
 
-    const decision = await this.signalToIntentPolicy.evaluate(event, { nowMs: Date.now() });
+    const decision = await this.signalToIntentPolicy.evaluate(event, { nowMs: this.clock.nowMs() });
     if (!decision.allow) {
       this.auditDecision({
         action: "signal_intent_rejected",
@@ -650,7 +834,7 @@ export class TradingRuntime {
     }
 
     try {
-      await this.ingest(signalIntentDecisionToEventInput(this.signalToIntentPolicy, event, decision, { nowMs: Date.now() }));
+      await this.ingest(signalIntentDecisionToEventInput(this.signalToIntentPolicy, event, decision, { nowMs: this.clock.nowMs() }));
       this.auditDecision({
         action: "signal_intent_generated",
         seq: event.seq,
@@ -702,7 +886,7 @@ export class TradingRuntime {
         this.seq += 1;
         return this.seq;
       },
-      Date.now()
+      this.clock.nowMs()
     );
     if (result === undefined) {
       return;
@@ -732,6 +916,103 @@ export class TradingRuntime {
       causationId: result.event.causationId,
       payload: result.event.payload
     });
+  }
+
+  private async observeAcceptedOrderSubmission(event: RuntimeEvent): Promise<void> {
+    if (event.eventType !== "ORDER_SUBMITTED") {
+      return;
+    }
+
+    for (const orderId of this.orderIdentifiers(event)) {
+      this.liveOrderIds.add(orderId);
+    }
+
+    if (!this.shouldSubmitLiveOrder(event)) {
+      return;
+    }
+
+    try {
+      await this.liveExecution.submitOrder(event);
+      this.auditDecision({
+        action: "live_order_submission_attested",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        symbol: event.symbol,
+        reason: "binance_live_execution"
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "live_order_submission_failed";
+      this.risk.halt(reason);
+      await this.enterSafeModeWithNextSeq(event, { allow: false, reason });
+    }
+  }
+
+  private withLiveExecutionMetadata(intent: RuntimeEvent, producedEvent: RuntimeEvent): RuntimeEvent {
+    if (producedEvent.eventType !== "ORDER_SUBMITTED") {
+      return producedEvent;
+    }
+    const liveExecution = intent.payload.liveExecution === true ? { liveExecution: true } : {};
+    const executionMode = intent.payload.executionMode === "LIVE" ? { executionMode: "LIVE" } : {};
+    const dailyLoss = typeof intent.payload.dailyLossUsd === "number" ? { dailyLossUsd: intent.payload.dailyLossUsd } : {};
+    if (Object.keys(liveExecution).length === 0 && Object.keys(executionMode).length === 0 && Object.keys(dailyLoss).length === 0) {
+      return producedEvent;
+    }
+    return RuntimeEventSchema.parse({
+      ...producedEvent,
+      payload: {
+        ...producedEvent.payload,
+        ...liveExecution,
+        ...executionMode,
+        ...dailyLoss
+      }
+    });
+  }
+
+  private shouldSubmitLiveOrder(event: RuntimeEvent): boolean {
+    if (this.state.mode() === "REPLAY" || this.state.mode() === "HIBERNATION_MODE" || this.state.mode() === "GOVERNANCE_HALT" || !this.state.canSubmitOrders()) {
+      return false;
+    }
+    return event.payload.liveExecution === true || event.payload.executionMode === "LIVE";
+  }
+
+  private async failClosedOnOrphanFill(event: RuntimeEvent): Promise<boolean> {
+    if (event.source !== "binance_user_ws" || event.eventType !== "ORDER_FILLED") {
+      return false;
+    }
+    const orderIds = this.orderIdentifiers(event);
+    const matched = orderIds.some((orderId) => this.liveOrderIds.has(orderId));
+    if (matched) {
+      return false;
+    }
+
+    const reason = "orphan_fill";
+    this.metrics.orphanFillsDetected += 1;
+    this.auditDecision({
+      action: "orphan_fill_detected",
+      seq: event.seq,
+      eventType: event.eventType,
+      correlationId: event.correlationId,
+      symbol: event.symbol,
+      reason
+    });
+    this.risk.halt(reason);
+    await this.enterSafeModeWithNextSeq(event, { allow: false, reason });
+    return true;
+  }
+
+  private orderIdentifiers(event: RuntimeEvent): string[] {
+    const candidates = [
+      event.payload.orderClientId,
+      event.payload.clientOrderId,
+      event.payload.orderId,
+      event.payload.idempotencyKey,
+      event.causationId
+    ];
+    return candidates
+      .filter((value): value is string | number => typeof value === "string" || typeof value === "number")
+      .map((value) => String(value))
+      .filter((value) => value.length > 0);
   }
 
   private observeMarketSnapshot(event: RuntimeEvent): void {
@@ -772,7 +1053,7 @@ export class TradingRuntime {
   }
 
   private toRuntimeEvent(input: EventInput): RuntimeEvent {
-    const now = Date.now();
+    const now = this.clock.nowMs();
     const event = RuntimeEventSchema.parse({
       ...input,
       seq: input.seq ?? this.seq + 1,
@@ -830,7 +1111,7 @@ export class TradingRuntime {
     if (this.state.mode() !== "SAFE_MODE") {
       this.state.transition("SAFE_MODE");
     }
-    const now = Date.now();
+    const now = this.clock.nowMs();
     const event = RuntimeEventSchema.parse({
       seq: this.seq + 1,
       timestamp: now,
@@ -962,6 +1243,32 @@ export class TradingRuntime {
     });
   }
 
+  private restorePersistedSequenceState(): void {
+    let cursor = 1;
+    while (true) {
+      const events = this.eventStore.readFrom(cursor, TradingRuntime.PERSISTED_SEQ_SCAN_BATCH_SIZE);
+      if (events.length === 0) return;
+
+      let maxSeqInBatch = cursor - 1;
+      for (const event of events) {
+        this.seq = Math.max(this.seq, event.seq);
+        maxSeqInBatch = Math.max(maxSeqInBatch, event.seq);
+        this.seenSeq.add(event.seq);
+        if (event.eventId !== undefined) {
+          this.seenEventIds.add(event.eventId);
+        }
+        if (event.eventType === "ORDER_SUBMITTED") {
+          for (const orderId of this.orderIdentifiers(event)) {
+            this.liveOrderIds.add(orderId);
+          }
+        }
+      }
+
+      if (events.length < TradingRuntime.PERSISTED_SEQ_SCAN_BATCH_SIZE) return;
+      cursor = maxSeqInBatch + 1;
+    }
+  }
+
   private waitForIngestIdle(): Promise<void> {
     if (this.activeIngests === 0) {
       return Promise.resolve();
@@ -992,6 +1299,7 @@ export class TradingRuntime {
   }
 
   private alertForAuditEntry(entry: AuditEntry): void {
+    if (!this.shouldSendAlert(entry)) return;
     const message = this.alertMessage(entry);
     if (message === undefined) return;
     void this.notifier.sendAlert(message).catch((error) => {
@@ -1002,38 +1310,171 @@ export class TradingRuntime {
     });
   }
 
+  private shouldSendAlert(entry: AuditEntry): boolean {
+    const key = this.alertDedupeKey(entry);
+    if (key === undefined) return true;
+
+    const now = this.clock.nowMs();
+    const lastSentAt = this.alertSentAtByKey.get(key);
+    if (lastSentAt !== undefined && now - lastSentAt < TradingRuntime.ALERT_DEDUPE_WINDOW_MS) {
+      return false;
+    }
+    this.alertSentAtByKey.set(key, now);
+    return true;
+  }
+
+  private alertDedupeKey(entry: AuditEntry): string | undefined {
+    if (
+      entry.action !== "safe_mode_entered" &&
+      entry.action !== "event_rejected" &&
+      entry.action !== "market_stream_disconnected" &&
+      entry.action !== "market_stream_reconnecting"
+    ) {
+      return undefined;
+    }
+
+    return [
+      entry.action,
+      entry.reason ?? "unknown",
+      entry.symbol ?? "global",
+      entry.eventType ?? "runtime"
+    ].join(":");
+  }
+
   private alertMessage(entry: AuditEntry): string | undefined {
+    const payload = this.alertPayload(entry);
+    return payload === undefined ? undefined : buildTelegramAlert(payload);
+  }
+
+  private alertPayload(entry: AuditEntry): TelegramAlertPayload | undefined {
+    const language = this.config.telegramLanguage;
+    const mode = this.config.telegramAlertMode;
     if (entry.action === "runtime_started") {
-      return `TradingRuntime started profile=${entry.runtimeProfile ?? "unknown"}`;
+      return {
+        kind: "runtime_started",
+        severity: "INFO",
+        primaryTag: "#RUNTIME",
+        language,
+        mode,
+        profile: String(entry.runtimeProfile ?? "unknown")
+      };
     }
     if (entry.action === "runtime_stopped") {
-      return "TradingRuntime stopped";
+      return { kind: "runtime_stopped", severity: "INFO", primaryTag: "#RUNTIME", language, mode };
     }
     if (entry.action === "safe_mode_entered") {
-      return `SAFE_MODE entered reason=${entry.reason ?? "unknown"} correlation=${entry.correlationId ?? "n/a"}`;
+      return {
+        kind: "safe_mode",
+        severity: "CRITICAL",
+        primaryTag: "#RUNTIME",
+        secondaryTags: ["#RISK"],
+        language,
+        mode,
+        reason: entry.reason ?? "unknown",
+        correlationId: entry.correlationId ?? "n/a",
+        correlation: this.alertCorrelation(entry)
+      };
+    }
+    if (entry.action === "live_execution_fatal_shutdown" || entry.action === "hibernation_mode_entered") {
+      return {
+        kind: "runtime_error",
+        severity: "CRITICAL",
+        primaryTag: "#RUNTIME",
+        language,
+        mode,
+        reason: entry.reason ?? entry.action,
+        correlationId: entry.correlationId ?? "n/a",
+        correlation: this.alertCorrelation(entry)
+      };
     }
     if (entry.action === "dry_run_order_submitted_generated") {
-      return `DRY_RUN ORDER_SUBMITTED correlation=${entry.correlationId ?? "n/a"} seq=${entry.seq ?? "n/a"}`;
+      return {
+        kind: "order_submitted",
+        severity: "INFO",
+        primaryTag: "#ORDER",
+        language,
+        mode,
+        correlationId: entry.correlationId ?? "n/a",
+        correlation: this.alertCorrelation(entry),
+        ...(entry.seq === undefined ? {} : { seq: entry.seq })
+      };
     }
     if (entry.action === "paper_fill_generated") {
-      return `Simulated ORDER_FILLED notional=${entry.value ?? "n/a"} correlation=${entry.correlationId ?? "n/a"}`;
+      return {
+        kind: "order_filled",
+        severity: "INFO",
+        primaryTag: "#ORDER",
+        language,
+        mode,
+        value: entry.value ?? "n/a",
+        correlationId: entry.correlationId ?? "n/a",
+        correlation: this.alertCorrelation(entry),
+        ...(entry.seq === undefined ? {} : { seq: entry.seq })
+      };
     }
     if (entry.action === "event_rejected") {
-      return `Runtime event rejected reason=${entry.reason ?? "unknown"} correlation=${entry.correlationId ?? "n/a"}`;
+      return {
+        kind: "runtime_error",
+        severity: "CRITICAL",
+        primaryTag: "#RUNTIME",
+        language,
+        mode,
+        reason: entry.reason ?? "unknown",
+        correlationId: entry.correlationId ?? "n/a",
+        correlation: this.alertCorrelation(entry)
+      };
     }
     if (entry.action === "market_stream_disconnected") {
-      return `Websocket disconnected symbol=${entry.symbol ?? "n/a"} reason=${entry.reason ?? "unknown"}`;
+      return {
+        kind: "websocket_disconnected",
+        severity: "WARNING",
+        primaryTag: "#WS",
+        language,
+        mode,
+        symbol: entry.symbol ?? "n/a",
+        reason: entry.reason ?? "unknown",
+        correlation: this.alertCorrelation(entry)
+      };
     }
     if (entry.action === "market_stream_reconnecting") {
-      return `Websocket reconnecting symbol=${entry.symbol ?? "n/a"} reason=${entry.reason ?? "unknown"}`;
+      return {
+        kind: "websocket_reconnecting",
+        severity: "WARNING",
+        primaryTag: "#WS",
+        language,
+        mode,
+        symbol: entry.symbol ?? "n/a",
+        reason: entry.reason ?? "unknown",
+        correlation: this.alertCorrelation(entry)
+      };
     }
     if (entry.action === "paper_performance_updated") {
-      const realized = entry.metrics?.realizedPnlUsd;
-      const unrealized = entry.metrics?.unrealizedPnlUsd;
-      const drawdown = entry.metrics?.maxDrawdownUsd;
-      return `Paper PnL updated realized=${String(realized ?? "n/a")} unrealized=${String(unrealized ?? "n/a")} maxDrawdown=${String(drawdown ?? "n/a")}`;
+      const realized = Number(entry.metrics?.realizedPnlUsd ?? 0);
+      const unrealized = Number(entry.metrics?.unrealizedPnlUsd ?? 0);
+      const maxDrawdownUsd = Number(entry.metrics?.maxDrawdownUsd);
+      const winRate = Number(entry.metrics?.winRate);
+      return {
+        kind: "pnl_snapshot",
+        severity: "INFO",
+        primaryTag: "#ORDER",
+        language,
+        mode,
+        realizedPnlUsd: realized,
+        unrealizedPnlUsd: unrealized,
+        totalPnlUsd: realized + unrealized,
+        correlation: this.alertCorrelation(entry),
+        ...(Number.isFinite(maxDrawdownUsd) ? { maxDrawdownUsd } : {}),
+        ...(Number.isFinite(winRate) ? { winRate } : {})
+      };
     }
     return undefined;
+  }
+
+  private alertCorrelation(entry: AuditEntry): TelegramAlertPayload["correlation"] {
+    return {
+      ...(entry.correlationId === undefined ? {} : { traceId: entry.correlationId }),
+      ...(entry.eventType === undefined || entry.seq === undefined ? {} : { eventId: `${entry.eventType}:${entry.seq}` })
+    };
   }
 
   private auditMetricBreach(metric: string, value: number, threshold: number, reason: string): void {
@@ -1047,10 +1488,24 @@ export class TradingRuntime {
   }
 
   private reportRuntimeHealth(): void {
+    this.flushEventStore();
     this.auditDecision({
       action: "runtime_health_report",
       metrics: this.healthSnapshot() as unknown as Record<string, unknown>
     });
+  }
+
+  private flushEventStore(): void {
+    try {
+      this.eventStore.flush?.();
+    } catch (error) {
+      this.audit.record({
+        action: "event_store_flush_failed",
+        reason: error instanceof Error ? error.message : "event_store_flush_failed"
+      });
+      this.risk.halt("event_store_flush_failed");
+      this.enterSafeModeForRuntimeBreach("event_store_flush_failed");
+    }
   }
 
   private observeQueueDepth(queueDepth: number): void {

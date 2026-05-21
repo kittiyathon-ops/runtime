@@ -21,6 +21,9 @@ export class TelegramNotifier implements AlertNotifier {
   private readonly botToken: string;
   private readonly chatId: string;
   private readonly fetchImpl: TelegramFetch;
+  private mutedUntilMs = 0;
+
+  private static readonly DEFAULT_RATE_LIMIT_BACKOFF_MS = 60_000;
 
   constructor(
     config: Pick<RuntimeConfig, "telegramAlertsEnabled" | "telegramBotToken" | "telegramChatId">,
@@ -38,6 +41,9 @@ export class TelegramNotifier implements AlertNotifier {
 
   async sendAlert(message: string): Promise<void> {
     if (!this.enabled) return;
+    const now = Date.now();
+    if (now < this.mutedUntilMs) return;
+
     const response = await this.fetchImpl(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -48,6 +54,9 @@ export class TelegramNotifier implements AlertNotifier {
       })
     });
     if (!response.ok) {
+      if (response.status === 429) {
+        this.mutedUntilMs = now + TelegramNotifier.DEFAULT_RATE_LIMIT_BACKOFF_MS;
+      }
       throw new Error(`telegram_send_failed:${response.status}`);
     }
   }

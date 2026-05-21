@@ -72,6 +72,74 @@ The runtime is deterministic at the event boundary: all accepted inputs are norm
 `src/runtime/state-machine.ts`
 : Defines allowed runtime mode transitions for `NORMAL`, `PAPER`, `REPLAY`, `SAFE_MODE`, `STOPPING`, and `HALTED`.
 
+`src/runtime/replay-engine.ts`
+: Provides the next-phase deterministic replay runtime with cursor/checkpoint state, pause/resume, replay speed modes, lag/watermark tracking, and integrity validation for missing, duplicate, and out-of-order sequence numbers.
+
+`src/runtime/risk-governor.ts`
+: Centralizes safety recommendations from exposure, leverage, drawdown, reject-rate, volatility, replay consistency, and persistence stability. It emits structured risk decisions but does not mutate runtime state.
+
+`src/runtime/execution-kernel.ts`
+: Enforces execution policy modes such as `ACTIVE`, `PASSIVE_ONLY`, `REDUCE_ONLY`, `SAFE_MODE`, and `HALT`. It validates/transforms intents and emits structured rejection events; it never submits orders.
+
+`src/contracts/*`
+: Defines canonical event contracts, explicit payload versions, schema compatibility checks, and registry lookup for replay-safe event interpretation.
+
+`src/runtime/event-source.ts`
+: Defines abstract replay/event sources so replay can read from SQLite, files, memory, live shadow streams, or future distributed sources without storage coupling.
+
+`src/runtime/portfolio-state-engine.ts`
+: Provides authoritative event-driven portfolio reconstruction from canonical events. Exchange adapters do not own portfolio state.
+
+`src/runtime/runtime-journal.ts`
+: Provides append-only runtime journal entries for events, transitions, replay markers, checkpoints, and forensic reconstruction.
+
+`src/runtime/portfolio-reconstruction-engine.ts`
+: Reconstructs authoritative portfolio snapshots from canonical events only. It detects duplicate fills, out-of-order fills, missing fills, and expected-state divergence.
+
+`src/runtime/snapshot-manager.ts` and `src/runtime/recovery-manager.ts`
+: Provide deterministic snapshot creation, validation, checkpoint metadata, and fail-closed recovery reports. Database repair is explicitly future work.
+
+`src/runtime/runtime-consensus.ts`
+: Provides single-node primary/shadow comparison scaffolding. It recommends SAFE_MODE or HALT but does not mutate runtime state.
+
+`src/dashboard/*`
+: Provides read-only serializable dashboard view models for timeline, alert stream, PnL, portfolio, runtime graph, replay, recovery, and consensus status.
+
+`src/edge/*`
+: Provides edge integrity analysis for normalized external input. It evaluates feed health, trust, latency, partitions, duplicate delivery, sequence gaps, and local feed consensus before runtime core consumption. Edge components recommend actions only and do not mutate runtime state.
+
+`src/runtime/governance-state-machine.ts`
+: Defines explicit governance states and transitions for survivability coordination across normal, degraded, safe, replay, shadow, and halted modes.
+
+`src/i18n/*`
+: Provides lightweight operator-facing alert message catalogs. Telegram alert transport stays separate from message text, and `TELEGRAM_LANGUAGE` selects Thai or English messages.
+
+## Infra Layer
+
+`src/infra/bounded-queue.ts`
+: Protects the runtime from event bursts by bounding in-memory queue growth and making overflow explicit.
+
+`src/infra/event-store.ts`
+: Defines the persistence abstraction used by replayable runtime events.
+
+`src/infra/sqlite-event-store.ts`
+: Provides one concrete `EventStore` implementation backed by SQLite.
+
+`src/infra/clock.ts`
+: Provides deterministic time through a `Clock` interface. `SystemClock` is the only infra clock that reads wall time directly, while `ManualClock`/`ReplayClock` allow replay and tests to control time explicitly.
+
+`src/infra/health-monitor.ts`
+: Evaluates generic runtime health from queue depth, latency, websocket state, replay lag, memory pressure, reject rate, and persistence availability. It maps health to safety actions such as `SAFE_MODE`, `PASSIVE_ONLY`, `HALT`, and `KILL_SWITCH`.
+
+`src/infra/metrics.ts`
+: Provides lightweight counters, gauges, and histograms with deterministic snapshots that can feed health evaluation and tests.
+
+`src/infra/idempotency-cache.ts`
+: Provides a bounded, TTL-based key cache for duplicate prevention. It depends on injected `Clock` rather than `Date.now()`, which keeps replay behavior deterministic.
+
+`src/infra/retry-policy.ts`
+: Provides bounded retry decisions, fixed/exponential backoff, retry budgets, and circuit breaker state. Unsafe order submission retries require an idempotency key; persistence and network reconnect retries can be bounded by policy.
+
 ## Event Lifecycle
 
 ```text
@@ -117,6 +185,24 @@ TradingRuntime.replayPersisted(fromSeq, limit)
 ```
 
 Replay duplicate bypass is only honored while the runtime mode is `REPLAY`. Normal runtime ingestion still rejects duplicate sequence numbers and duplicate event IDs.
+
+## Canonical Event Model
+
+Runtime contracts live in `src/contracts/`. Event versions are explicit and registry lookup validates payloads by event type and version. Exchange adapters normalize external payloads into canonical event contracts before runtime core sees them.
+
+Schema evolution is compatibility-checked. Current support is conservative: same-version and forward runtime upgrades are compatible; downgrades are rejected.
+
+## Portfolio Authority Model
+
+The portfolio state engine is the authoritative replay-safe state projection. It mutates only from canonical events such as `ORDER_FILLED` and `POSITION_UPDATED`.
+
+Adapters never own authoritative portfolio state. Runtime reconstruction can replay the same events through `PortfolioStateEngine.reconstruct(...)` and produce the same snapshot.
+
+## Runtime Journal Semantics
+
+The runtime journal is append-only. Entries have monotonically increasing journal sequence numbers and can reference runtime event sequences or checkpoints.
+
+Journal validation detects missing, duplicate, and out-of-order journal entries. The journal is intended for crash recovery, audit, governance transition tracing, and forensic replay.
 
 ## SAFE_MODE Triggers
 
@@ -205,6 +291,56 @@ malformed message
 ```
 
 Current reconnect handling audits `reconnecting` and fails closed into `SAFE_MODE`. It does not resume trading automatically and it does not add live order execution.
+
+## Adapter Boundary Design
+
+Exchange adapters live outside runtime core. The Binance adapter scaffold under `src/adapters/binance/` separates:
+
+- websocket lifecycle and idempotent delivery
+- REST boundary stubs
+- exchange payload normalization
+- adapter orchestration
+
+Adapters emit canonical `EventInput` and hide exchange-specific payload shape from runtime internals.
+
+## Deterministic Replay Guarantees
+
+Replay is sequence-first. The replay engine preserves original event order, tracks cursor/checkpoints, and validates:
+
+- missing sequence numbers
+- duplicate sequence numbers
+- out-of-order events
+
+Replay speed can be realtime, accelerated, or step-based, and all timing depends on injected `Clock`.
+
+## Risk Governance Flow
+
+The risk governor is advisory:
+
+```text
+runtime observations
+  -> RiskGovernor.evaluate(...)
+  -> structured recommendation
+  -> optional RISK_ALERT events
+  -> runtime decides whether/how to transition
+```
+
+Recommendations include `OK`, `REDUCE_ONLY`, `PASSIVE_ONLY`, `SAFE_MODE`, `HALT`, and `KILL_SWITCH`.
+
+## Execution Kernel Role
+
+The execution kernel validates intents against runtime policy before any adapter submission layer exists:
+
+```text
+intent
+  -> structural validation
+  -> mode policy checks
+  -> reduce-only/passive-only enforcement
+  -> optional adaptive sizing
+  -> accepted transformed intent or ORDER_REJECTED-compatible failures
+```
+
+It does not own exchange connectivity and cannot place real orders.
 
 ## Persistence Flow
 
