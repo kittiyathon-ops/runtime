@@ -17,3 +17,15 @@ export {
   type StartupReconciliationGateInput,
   type StartupReconciliationGateResult
 } from "./startup-reconciliation-gate.js";
+
+export {
+  evaluateStartupReconciliationAdapter,
+  type StartupReconciliationAdapterInput,
+  type StartupReconciliationAdapterResult
+} from "./startup-reconciliation-adapter.js";
+
+export {
+  recommendGovernanceForReconciliation,
+  type ReconciliationGovernanceBridgeInput,
+  type ReconciliationGovernanceBridgeResult
+} from "./reconciliation-governance-bridge.js";
