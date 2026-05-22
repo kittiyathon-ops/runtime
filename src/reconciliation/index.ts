@@ -10,3 +10,10 @@ export {
   type ReconciliationState,
   type TruthSnapshot
 } from "./deterministic-uncertainty-manager.js";
+
+export {
+  evaluateStartupReconciliationGate,
+  type StartupReconciliationDecision,
+  type StartupReconciliationGateInput,
+  type StartupReconciliationGateResult
+} from "./startup-reconciliation-gate.js";
