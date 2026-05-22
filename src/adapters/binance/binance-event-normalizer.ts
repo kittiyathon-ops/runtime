@@ -32,6 +32,7 @@ export class BinanceEventNormalizer implements ExchangeEventNormalizer<Record<st
         payload: {
           stream: this.stream,
           updateId,
+          sequence_id: updateId,
           bidPrice: numberLike(raw.b, "b"),
           bidQuantity: numberLike(raw.B, "B"),
           askPrice: numberLike(raw.a, "a"),
@@ -55,6 +56,7 @@ export class BinanceEventNormalizer implements ExchangeEventNormalizer<Record<st
         payload: {
           stream: this.stream,
           tradeId,
+          sequence_id: tradeId,
           price: numberLike(raw.p, "p"),
           quantity: numberLike(raw.q, "q"),
           buyerIsMaker: raw.m === true
@@ -74,6 +76,7 @@ export class BinanceEventNormalizer implements ExchangeEventNormalizer<Record<st
       causationId: "exchange",
       payload: {
         stream: this.stream,
+        sequence_id: numberLike(raw.E ?? receivedAt, "E"),
         markPrice: numberLike(raw.p, "p"),
         indexPrice: numberLike(raw.i, "i"),
         fundingRate: numberLike(raw.r, "r")

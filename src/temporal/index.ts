@@ -1,4 +1,5 @@
 export * from "./causal-order.js";
+export * from "./causal-reorder-buffer.js";
 export * from "./causality-window.js";
 export * from "./monotonic-clock.js";
 export * from "./replay-drift.js";

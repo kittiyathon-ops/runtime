@@ -1,6 +1,7 @@
 export * from "./attention-allocation.js";
 export * from "./cognitive-budget.js";
 export * from "./economy-attestation.js";
+export * from "./edge-attribution.js";
 export * from "./explanation-budget.js";
 export * from "./governance-cost.js";
 export * from "./operator-cognition.js";

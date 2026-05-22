@@ -532,6 +532,7 @@ export class BinanceLiveExecution {
         orderId: response.orderId,
         orderClientId: response.clientOrderId,
         status: response.status,
+        sequence_id: response.updateTime ?? response.transactTime ?? now,
         side: response.side,
         type: response.type,
         quantity: response.origQty,
@@ -598,7 +599,7 @@ export class BinanceLiveExecution {
       eventType: "EXECUTION_ERROR",
       correlationId: event.correlationId,
       causationId: String(event.seq),
-      payload: { reason, status: "ERROR" }
+        payload: { reason, status: "ERROR" }
     };
   }
 
@@ -627,6 +628,7 @@ export class BinanceLiveExecution {
         payload: {
           orderId: report.orderId,
           orderClientId: report.clientOrderId,
+          sequence_id: report.transactionTime ?? now,
           side: report.side,
           quantity: report.quantity,
           price: report.price,
@@ -650,6 +652,7 @@ export class BinanceLiveExecution {
         payload: {
           orderId: report.orderId,
           orderClientId: report.clientOrderId,
+          sequence_id: report.transactionTime ?? now,
           side: report.side,
           quantity: report.quantity,
           price: report.price,
@@ -673,6 +676,7 @@ export class BinanceLiveExecution {
         payload: {
           orderId: report.orderId,
           orderClientId: report.clientOrderId,
+          sequence_id: report.transactionTime ?? now,
           reason: report.rejectReason ?? "exchange_rejected",
           status: "REJECTED"
         }
@@ -692,6 +696,7 @@ export class BinanceLiveExecution {
       causationId: "account_update",
       payload: {
         quantity: report.positionQuantity,
+        sequence_id: report.transactionTime ?? now,
         price: report.price
       }
     };

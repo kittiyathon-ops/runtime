@@ -1,0 +1,36 @@
+name: Trading Runtime Assistant
+
+models:
+  - name: Gemini 2.5 Pro
+    provider: gemini
+    model: gemini-2.5-pro
+    apiKey: AIzaSyDMMOv3uYU_qlt96MaPEeSpDdu6sbz0KqQ
+
+  - name: Gemini Flash
+    provider: gemini
+    model: gemini-2.5-flash
+    apiKey: AIzaSyDMMOv3uYU_qlt96MaPEeSpDdu6sbz0KqQ
+
+context:
+  - provider: code
+  - provider: docs
+  - provider: diff
+  - provider: terminal
+  - provider: problems
+  - provider: folder
+
+slashCommands:
+  - name: review
+    description: Review current code carefully
+
+  - name: refactor
+    description: Refactor selected code safely
+
+  - name: runtime
+    description: Analyze runtime architecture and safety
+
+  - name: reconcile
+    description: Analyze reconciliation correctness
+
+  - name: determinism
+    description: Check deterministic behavior

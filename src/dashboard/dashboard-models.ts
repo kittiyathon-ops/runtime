@@ -4,6 +4,7 @@ import type { ConsensusCheckResult } from "../runtime/runtime-consensus.js";
 import type { PortfolioSnapshot } from "../runtime/portfolio-state-engine.js";
 import type { RecoveryReport } from "../runtime/recovery-manager.js";
 import type { RuntimeTimelineEntry } from "../runtime/runtime-timeline.js";
+import type { EdgeAttributionReport } from "../economy/edge-attribution.js";
 
 export interface DashboardTimelineEntry {
   id: number;
@@ -41,6 +42,16 @@ export interface DashboardRuntimeGraph {
   edges: Array<{ from: string; to: string; label?: string }>;
 }
 
+export interface DashboardEdgeAttributionSection {
+  section: "EDGE_ATTRIBUTION";
+  prominence: "PRIMARY";
+  report: EdgeAttributionReport;
+  runtimeEdgeBps: number;
+  marketEdgeBps: number;
+  totalCostBps: number;
+  viable: boolean;
+}
+
 export interface DashboardReplayStatus {
   status: string;
   lastSeq: number;
@@ -72,4 +83,3 @@ export function timelineEntryToDashboard(entry: RuntimeTimelineEntry): Dashboard
     dashboard: entry.dashboard
   };
 }
-

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TradingRuntime } from "../src/runtime/runtime.js";
+import { resolveConflict, type AuthoritativeState } from "../src/arbitration/exchange-state-authority.js";
+import { PayloadTrustScorer } from "../src/bridge/PayloadTrustScoring.js";
 import { RequestGovernor } from "../src/bridge/RequestGovernor.js";
 import { RestApiGovernor } from "../src/bridge/RestApiGovernor.js";
 import { ExchangePayloadGuard } from "../src/bridge/ExchangePayloadGuard.js";
@@ -37,6 +39,16 @@ import { EMOJI, severityEmoji, tagEmoji } from "../src/notifications/emoji-map.j
 import { buildTelegramAlert } from "../src/notifications/telegram-alert-builder.js";
 import { formatPositionClosed, formatUsd } from "../src/notifications/telegram-formatter.js";
 import { RuntimeReplayEngine } from "../src/runtime/replay-engine.js";
+import { RuntimeStateMachine, transitionRule } from "../src/runtime/state-machine.js";
+import {
+  DeterministicRestartCoordinator,
+  EventLoopLagMonitor,
+  GcPauseInstrumentation,
+  ProcessSurvivabilityMonitor
+} from "../src/runtime/process-survivability.js";
+import { configFingerprint } from "../src/runtime/config-fingerprint.js";
+import { truthConfidenceState } from "../src/runtime/truth-confidence.js";
+import { OperatorOverrideLedger } from "../src/oversight/operator-override-ledger.js";
 import { MemoryEventSource } from "../src/runtime/event-source.js";
 import { EventSchemaRegistry } from "../src/contracts/event-schema-registry.js";
 import { BinanceEventNormalizer } from "../src/adapters/binance/binance-event-normalizer.js";
@@ -54,7 +66,7 @@ import { RecoveryManager, type RecoveryEventSource } from "../src/runtime/recove
 import { RuntimeConsensus } from "../src/runtime/runtime-consensus.js";
 import { ShadowRuntime } from "../src/runtime/shadow-runtime.js";
 import { buildPortfolioSummary, buildPnlSummary } from "../src/dashboard/dashboard-pnl-view.js";
-import { buildRuntimeStateGraph } from "../src/dashboard/dashboard-runtime-view.js";
+import { buildEdgeAttributionSection, buildRuntimeStateGraph } from "../src/dashboard/dashboard-runtime-view.js";
 import { buildTimelineView } from "../src/dashboard/dashboard-timeline-view.js";
 import { buildConsensusStatus, buildRecoveryStatus, buildReplayStatus } from "../src/dashboard/dashboard-replay-view.js";
 import {
@@ -591,6 +603,8 @@ const baseConfig: RuntimeConfig = {
   maxLeverage: 1,
   maxDrawdownUsd: 1_000,
   idempotencyCacheSize: 100,
+  maxReorderWindowMs: 0,
+  clockSkewAlertMs: 1_000,
   paperFillSimulationEnabled: false,
   paperFillSlippageBps: 0,
   telegramAlertsEnabled: false,
@@ -5127,6 +5141,436 @@ test("runtime health metrics count SAFE_MODE and websocket reconnects", async ()
   assert.equal(eventStore.events[0]?.eventType, "SAFE_MODE");
 
   await runtime.stop();
+});
+
+test("exchange authority hierarchy downgrades lower authority conflicts", () => {
+  const audit = new MemoryAuditLog();
+  const local: AuthoritativeState = {
+    authority: "WEBSOCKET_ORDER_UPDATE",
+    state: { symbol: "BTCUSDT", orderId: "1", status: "NEW" },
+    evidenceId: "ws_order",
+    observedAt: 1
+  };
+  const rest: AuthoritativeState = {
+    authority: "REST_ORDER_STATE",
+    state: { symbol: "BTCUSDT", orderId: "1", status: "FILLED" },
+    evidenceId: "rest_order",
+    observedAt: 2
+  };
+
+  const resolved = resolveConflict(local, rest, audit);
+  assert.equal(resolved.status, "RESOLVED");
+  assert.equal(resolved.selectedAuthority, "REST_ORDER_STATE");
+  assert.equal(resolved.state.status, "FILLED");
+  assert.equal(audit.entries("CONFIDENCE_DOWNGRADE").length, 1);
+});
+
+test("equal authority identity conflict requires halt", () => {
+  const resolved = resolveConflict(
+    { authority: "REST_ORDER_STATE", state: { orderId: "1", status: "NEW" }, evidenceId: "a", observedAt: 1 },
+    { authority: "REST_ORDER_STATE", state: { orderId: "2", status: "NEW" }, evidenceId: "b", observedAt: 2 }
+  );
+  assert.equal(resolved.status, "HALT_REQUIRED");
+  assert.match(resolved.reason, /unresolvable_equal_authority_conflict/);
+});
+
+test("causal exchange ingest audits clock skew and causal uncertainty", async () => {
+  const audit = new MemoryAuditLog();
+  const eventStore = new MemoryEventStore();
+  const config = { ...baseConfig, clockSkewAlertMs: 10 };
+  const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
+
+  await runtime.ingestExternalMarketEvent({
+    eventId: "binance:trade:BTCUSDT:1",
+    timestamp: 1_000,
+    exchangeTimestamp: 1_000,
+    receiveTimestamp: 2_000,
+    source: "binance_market_ws",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_causal",
+    causationId: "exchange",
+    payload: { stream: "trade", tradeId: 1, price: 100, quantity: 1, sequence_id: 1 }
+  });
+
+  assert.equal(audit.entries("CLOCK_SKEW_ALERT").length, 1);
+  assert.equal(eventStore.events[0]?.payload.exchange_time, 1_000);
+  assert.equal(eventStore.events[0]?.payload.received_time, 2_000);
+});
+
+test("payload trust scoring rejects unsafe exchange payloads", () => {
+  const assessment = new PayloadTrustScorer().assess({
+    timestamp: 1,
+    source: "binance_market_ws",
+    symbol: "BTCUSDT",
+    eventType: "MARKET_TICK",
+    correlationId: "corr_trust",
+    causationId: "exchange",
+    payload: { price: Number.NaN }
+  });
+  assert.equal(assessment.acceptanceDecision, "REJECT");
+  assert.ok(assessment.flags.includes("non_finite_numeric_payload"));
+});
+
+test("truth confidence governance maps degraded disputed and unknown states", () => {
+  assert.equal(truthConfidenceState({ causalUncertaintyCount: 0, confidenceDowngradeCount: 0, disputed: false, unknown: false }).confidence, "HIGH_CONFIDENCE");
+  assert.equal(truthConfidenceState({ causalUncertaintyCount: 1, confidenceDowngradeCount: 0, disputed: false, unknown: false }).positionSizeMultiplier, 0.5);
+  assert.equal(truthConfidenceState({ causalUncertaintyCount: 0, confidenceDowngradeCount: 0, disputed: true, unknown: false }).haltNewOrders, true);
+  assert.equal(truthConfidenceState({ causalUncertaintyCount: 0, confidenceDowngradeCount: 0, disputed: false, unknown: true }).enterSafeMode, true);
+});
+
+test("operator override ledger enforces quota dual authorization and immutability", () => {
+  const ledger = new OperatorOverrideLedger({ quotaPer24h: 1 });
+  const record = ledger.append({
+    overrideId: "ovr_1",
+    operatorId: "op_1",
+    secondaryOperatorId: "op_2",
+    severity: "HIGH",
+    action: "release_quarantine",
+    reason: "manual verified",
+    timestamp: 1_700_000_000_000,
+    evidenceIds: ["ev_override"]
+  });
+  assert.equal(Object.isFrozen(record), true);
+  assert.throws(() => ledger.append({
+    overrideId: "ovr_2",
+    operatorId: "op_1",
+    severity: "LOW",
+    action: "override",
+    reason: "quota check",
+    timestamp: 1_700_000_000_001,
+    evidenceIds: ["ev_override_2"]
+  }), /operator_override_quota_exceeded/);
+  assert.throws(() => new OperatorOverrideLedger({ quotaPer24h: 2 }).append({
+    overrideId: "ovr_3",
+    operatorId: "op_1",
+    severity: "HIGH",
+    action: "override",
+    reason: "dual check",
+    timestamp: 1,
+    evidenceIds: ["ev_override_3"]
+  }), /high_severity_override_requires_dual_authorization/);
+});
+
+test("runtime state machine declares economically unviable transition metadata", () => {
+  const state = new RuntimeStateMachine("PAPER");
+  state.transition("ECONOMICALLY_UNVIABLE", ["negative_net_edge"]);
+  assert.equal(state.mode(), "ECONOMICALLY_UNVIABLE");
+  const rule = transitionRule("PAPER", "ECONOMICALLY_UNVIABLE");
+  assert.equal(rule.authorization, "auto");
+  assert.deepEqual(rule.requiredEvidence, ["negative_net_edge"]);
+  assert.throws(() => state.transition("NORMAL"), /invalid_runtime_transition:ECONOMICALLY_UNVIABLE->NORMAL/);
+});
+
+test("config fingerprint is deterministic and changes on mutation", () => {
+  const first = configFingerprint(baseConfig);
+  const second = configFingerprint({ ...baseConfig });
+  const mutated = configFingerprint({ ...baseConfig, maxOrderNotionalUsd: baseConfig.maxOrderNotionalUsd + 1 });
+  assert.equal(first, second);
+  assert.notEqual(first, mutated);
+});
+
+test("process survivability monitors heap gc queues and restart reverification", () => {
+  const monitor = new ProcessSurvivabilityMonitor({
+    maxHeapUtilization: 0.8,
+    maxGcPauseRatio: 0.1,
+    maxQueueUtilization: 0.75,
+    restartCadenceMs: 1_000,
+    maxSurvivabilityCpuMemoryRatio: 0.15
+  });
+  const first = monitor.observe("runtime_a", {
+    timestamp: 1_000,
+    heapUsedBytes: 70,
+    heapLimitBytes: 100,
+    gcPauseMs: 5,
+    windowMs: 100,
+    asyncQueueDepth: 2,
+    asyncQueueCapacity: 10,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1
+  }, ["ev_process_1"]);
+  assert.equal(first.status, "PROCESS_SURVIVABILITY_OK");
+
+  const due = monitor.observe("runtime_a", {
+    timestamp: 2_000,
+    heapUsedBytes: 90,
+    heapLimitBytes: 100,
+    gcPauseMs: 20,
+    windowMs: 100,
+    asyncQueueDepth: 9,
+    asyncQueueCapacity: 10,
+    cpuOverheadRatio: 0.16,
+    memoryOverheadRatio: 0.16
+  }, ["ev_process_2"]);
+  assert.equal(due.status, "DETERMINISTIC_RESTART_REQUIRED");
+  assert.ok(due.reasons.includes("heap_pressure"));
+  assert.ok(due.reasons.includes("deterministic_restart_cadence_due"));
+
+  const verified = monitor.verifyRestart("runtime_a", 2_001, true, ["ev_reverify"]);
+  assert.equal(verified.status, "RESTART_REVERIFIED");
+  assert.equal(monitor.verifyEvidence(), true);
+});
+
+test("process survivability emits rolling p50 p95 p99 and memory leak heuristic", () => {
+  const monitor = new ProcessSurvivabilityMonitor({
+    maxHeapUtilization: 0.95,
+    maxGcPauseRatio: 0.5,
+    maxQueueUtilization: 0.9,
+    restartCadenceMs: 10_000,
+    maxSurvivabilityCpuMemoryRatio: 0.15,
+    rollingWindowSize: 5,
+    memoryLeakSlopeBytesPerSample: 10
+  });
+  let decision = monitor.observe("runtime_metrics", {
+    timestamp: 1,
+    heapUsedBytes: 100,
+    heapLimitBytes: 1_000,
+    gcPauseMs: 1,
+    windowMs: 100,
+    asyncQueueDepth: 1,
+    asyncQueueCapacity: 100,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1,
+    eventLoopLagMs: 1,
+    timerDriftMs: 2,
+    websocketProcessingLatencyMs: 3,
+    reconciliationLatencyMs: 4
+  }, ["ev_process_metrics_1"]);
+  for (let index = 2; index <= 5; index += 1) {
+    decision = monitor.observe("runtime_metrics", {
+      timestamp: index,
+      heapUsedBytes: 100 + index * 100,
+      heapLimitBytes: 1_000,
+      gcPauseMs: index,
+      windowMs: 100,
+      asyncQueueDepth: index,
+      asyncQueueCapacity: 100,
+      cpuOverheadRatio: 0.1,
+      memoryOverheadRatio: 0.1,
+      eventLoopLagMs: index,
+      timerDriftMs: index,
+      websocketProcessingLatencyMs: index,
+      reconciliationLatencyMs: index
+    }, [`ev_process_metrics_${index}`]);
+  }
+  assert.equal(decision.memoryLeakSuspected, true);
+  assert.equal(decision.rollingMetrics.eventLoopLag.p50, 3);
+  assert.equal(decision.rollingMetrics.eventLoopLag.p95, 5);
+  assert.equal(decision.rollingMetrics.eventLoopLag.p99, 5);
+});
+
+test("event loop lag monitor detects timer drift deterministically", () => {
+  const lag = new EventLoopLagMonitor(100);
+  assert.deepEqual(lag.sample(1_000), { eventLoopLagMs: 0, timerDriftMs: 0 });
+  assert.deepEqual(lag.sample(1_175), { eventLoopLagMs: 75, timerDriftMs: 75 });
+});
+
+test("GC pause instrumentation exposes perf_hooks collector lifecycle", () => {
+  const gc = new GcPauseInstrumentation();
+  gc.start();
+  assert.equal(gc.drainPauseMs(), 0);
+  gc.stop();
+});
+
+test("runtime survivability emits latency and process degradation evidence", () => {
+  const audit = new MemoryAuditLog();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore(), audit });
+  runtime.observeProcessSurvivability({
+    timestamp: 1_700_000_000_000,
+    heapUsedBytes: 100,
+    heapLimitBytes: 1_000,
+    gcPauseMs: 200,
+    windowMs: 1_000,
+    asyncQueueDepth: 1,
+    asyncQueueCapacity: 100,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1,
+    activeTrading: true
+  });
+  runtime.observeProcessSurvivability({
+    timestamp: 1_700_000_000_001,
+    heapUsedBytes: 100,
+    heapLimitBytes: 1_000,
+    gcPauseMs: 1,
+    windowMs: 1_000,
+    asyncQueueDepth: 1,
+    asyncQueueCapacity: 100,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1,
+    eventLoopLagMs: 200
+  });
+  assert.equal(audit.entries("LATENCY_ALERT").length, 1);
+  assert.equal(audit.entries("PROCESS_DEGRADED").some((entry) => entry.reason === "event_loop_blocked"), true);
+});
+
+test("runtime survivability enters SAFE_MODE on reconciliation starvation and queue explosion", () => {
+  const reconciliationAudit = new MemoryAuditLog();
+  const reconciliationRuntime = new TradingRuntime({
+    config: baseConfig,
+    logger: createLogger(baseConfig),
+    eventStore: new MemoryEventStore(),
+    audit: reconciliationAudit
+  });
+  reconciliationRuntime.observeProcessSurvivability({
+    timestamp: 1_700_000_000_000,
+    heapUsedBytes: 100,
+    heapLimitBytes: 1_000,
+    gcPauseMs: 1,
+    windowMs: 1_000,
+    asyncQueueDepth: 1,
+    asyncQueueCapacity: 100,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1,
+    reconciliationBlockedMs: 1_000
+  });
+  assert.equal(reconciliationRuntime.state.mode(), "SAFE_MODE");
+  assert.equal(reconciliationAudit.entries("PROCESS_DEGRADED").some((entry) => entry.reason === "reconciliation_starvation"), true);
+
+  const queueAudit = new MemoryAuditLog();
+  const queueRuntime = new TradingRuntime({
+    config: baseConfig,
+    logger: createLogger(baseConfig),
+    eventStore: new MemoryEventStore(),
+    audit: queueAudit
+  });
+  queueRuntime.observeProcessSurvivability({
+    timestamp: 1_700_000_000_000,
+    heapUsedBytes: 100,
+    heapLimitBytes: 1_000,
+    gcPauseMs: 1,
+    windowMs: 1_000,
+    asyncQueueDepth: 96,
+    asyncQueueCapacity: 100,
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1
+  });
+  assert.equal(queueRuntime.state.mode(), "SAFE_MODE");
+  assert.equal(queueAudit.entries("PROCESS_DEGRADED").some((entry) => entry.reason === "async_queue_explosion_halt_new_trading"), true);
+});
+
+test("deterministic restart coordinator blocks unsafe restart windows", () => {
+  const monitor = new ProcessSurvivabilityMonitor({ restartCadenceMs: 1_000 });
+  const coordinator = new DeterministicRestartCoordinator(monitor);
+  const blocked = coordinator.coordinate({
+    runtimeId: "runtime_restart",
+    now: 1_000,
+    context: {
+      openPositions: true,
+      disputedTruth: true,
+      reconnectRecovery: true,
+      degradedReconciliation: true,
+      evidenceIds: ["ev_restart_blocked"]
+    },
+    state: { seq: 1 }
+  });
+  assert.equal(blocked.eligible, false);
+  assert.deepEqual(blocked.blockedBy, ["open_positions", "disputed_truth", "reconnect_recovery", "degraded_reconciliation"]);
+
+  const allowed = coordinator.coordinate({
+    runtimeId: "runtime_restart",
+    now: 2_000,
+    context: {
+      openPositions: false,
+      disputedTruth: false,
+      reconnectRecovery: false,
+      degradedReconciliation: false,
+      evidenceIds: ["ev_restart_allowed"]
+    },
+    state: { seq: 2 }
+  });
+  assert.equal(allowed.eligible, true);
+  assert.equal(allowed.preRestartEvidence?.status, "PRE_RESTART_EVIDENCE_PRESERVED");
+});
+
+test("edge accounting computes runtime and market edge and verifies tamper evidence", () => {
+  const ledger = new Economy.EdgeAccountingLedger();
+  const decision = ledger.record({
+    reportId: "edge_1",
+    periodStart: 1_700_000_000_000,
+    periodEnd: 1_700_086_400_000,
+    currency: "USD",
+    strategyGrossEdgeBps: 1,
+    executionQualityEdgeBps: 0.5,
+    survivabilityOverheadBps: 0.2,
+    reconciliationCostBps: 0.05,
+    governancePenaltyBps: 0.05,
+    operationalOverheadBps: 0.05,
+    infrastructureComplexityCostBps: 0.05,
+    edgeDecayRateBpsPerDay: 0.01,
+    subsystemRoi: [{ subsystemId: "reconciliation", runtimeEdgeBps: 0.4, marketEdgeBps: 0.1, costBps: 0.1, roiRatio: 5 }],
+    cpuOverheadRatio: 0.1,
+    memoryOverheadRatio: 0.1,
+    evidenceIds: ["ev_edge_1"]
+  });
+
+  assert.equal(decision.status, "ECONOMICALLY_VIABLE");
+  assert.equal(decision.report.netRealizedEdgeBps, 1.1);
+  assert.equal(ledger.verifyEvidence(), true);
+
+  const section = buildEdgeAttributionSection(decision.report);
+  assert.equal(section.section, "EDGE_ATTRIBUTION");
+  assert.equal(section.prominence, "PRIMARY");
+  assert.equal(section.marketEdgeBps, 1);
+  assert.equal(section.runtimeEdgeBps, 0.5);
+});
+
+test("edge accounting law gates economically unviable runtime", () => {
+  const audit = new MemoryAuditLog();
+  const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore: new MemoryEventStore(), audit });
+  const decision = runtime.recordEdgeAttributionReport({
+    reportId: "edge_unviable_1",
+    periodStart: 1_700_000_000_000,
+    periodEnd: 1_700_086_400_000,
+    currency: "USD",
+    strategyGrossEdgeBps: 0.02,
+    executionQualityEdgeBps: 0.01,
+    survivabilityOverheadBps: 0.03,
+    reconciliationCostBps: 0.01,
+    governancePenaltyBps: 0.01,
+    operationalOverheadBps: 0.01,
+    infrastructureComplexityCostBps: 0.01,
+    edgeDecayRateBpsPerDay: 0.02,
+    subsystemRoi: [{ subsystemId: "governance", runtimeEdgeBps: 0.01, marketEdgeBps: 0, costBps: 0.01, roiRatio: 1 }],
+    cpuOverheadRatio: 0.16,
+    memoryOverheadRatio: 0.1,
+    evidenceIds: ["ev_edge_unviable"]
+  });
+
+  assert.equal(decision.status, "ECONOMICALLY_UNVIABLE_REQUIRED");
+  assert.equal(runtime.state.mode(), "ECONOMICALLY_UNVIABLE");
+  assert.equal(audit.entries("edge_attribution_report").length, 1);
+  assert.equal(audit.entries("economically_unviable_entered").length, 1);
+  assert.ok(decision.violations.includes("minimum_viable_net_edge_breach"));
+  assert.ok(decision.violations.includes("survivability_cpu_overhead_exceeds_15_percent"));
+});
+
+test("edge accounting detects seven consecutive non-positive edge days", () => {
+  const ledger = new Economy.EdgeAccountingLedger();
+  const day = 24 * 60 * 60 * 1_000;
+  let decision: ReturnType<Economy.EdgeAccountingLedger["record"]> | undefined;
+  for (let index = 0; index < 7; index += 1) {
+    decision = ledger.record({
+      reportId: `edge_negative_${index}`,
+      periodStart: 1_700_000_000_000 + index * day,
+      periodEnd: 1_700_000_000_000 + (index + 1) * day,
+      currency: "USD",
+      strategyGrossEdgeBps: 0.01,
+      executionQualityEdgeBps: 0,
+      survivabilityOverheadBps: 0.02,
+      reconciliationCostBps: 0,
+      governancePenaltyBps: 0,
+      operationalOverheadBps: 0,
+      infrastructureComplexityCostBps: 0,
+      edgeDecayRateBpsPerDay: 0.01,
+      subsystemRoi: [{ subsystemId: "runtime_core", runtimeEdgeBps: 0.03, marketEdgeBps: 0, costBps: 0.01, roiRatio: 3 }],
+      cpuOverheadRatio: 0.1,
+      memoryOverheadRatio: 0.1,
+      evidenceIds: [`ev_edge_negative_${index}`]
+    });
+  }
+  assert.equal(decision?.consecutiveNonPositiveDays, 7);
+  assert.ok(decision?.violations.includes("net_realized_edge_non_positive_7_consecutive_days"));
+  Economy.assertDailyEdgeReportCadence(ledger.all());
 });
 
 test("RealityGraph appends provenance-bound evidence and assertions", () => {

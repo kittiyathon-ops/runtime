@@ -1,5 +1,6 @@
 import { AuditLog, type AuditEntry, type AuditSink } from "../audit/audit-log.js";
 import { NoopNotifier, TelegramNotifier, type AlertNotifier } from "../alerts/telegram-notifier.js";
+import { authorityForExchangeEvent, resolveConflict, type AuthoritativeState, type ExchangeAuthority } from "../arbitration/exchange-state-authority.js";
 import {
   BinanceMarketStream,
   normalizeBinanceMarketPayload,
@@ -26,6 +27,8 @@ import {
 } from "../live-execution/binance-live-execution.js";
 import { buildTelegramAlert } from "../notifications/telegram-alert-builder.js";
 import type { TelegramAlertPayload } from "../notifications/telegram-message-types.js";
+import { PayloadTrustScorer } from "../bridge/PayloadTrustScoring.js";
+import { EdgeAccountingLedger, type EdgeAccountingDecision, type EdgeAttributionInput } from "../economy/edge-attribution.js";
 import { PortfolioState } from "../portfolio/portfolio-state.js";
 import { ReplayEngine, type ReplayMismatch } from "../replay/replay-engine.js";
 import { RiskEngine, type RiskDecision, type RiskState } from "../risk/risk-engine.js";
@@ -39,45 +42,18 @@ import {
   type SignalToIntentPolicy
 } from "../signals/signal-engine.js";
 import { RuntimeStateMachine, type RuntimeMode } from "./state-machine.js";
+import { CausalReorderBuffer } from "../temporal/causal-reorder-buffer.js";
+import { captureConfigEvidence, configFingerprint, type ConfigEvidenceBundle } from "./config-fingerprint.js";
+import { truthConfidenceState, type TruthConfidenceState } from "./truth-confidence.js";
+import {
+  DEFAULT_PROCESS_SURVIVABILITY_CONFIG,
+  DeterministicRestartCoordinator,
+  ProcessSurvivabilityMonitor,
+  type ProcessSurvivabilityDecision,
+  type ProcessSurvivabilitySample
+} from "./process-survivability.js";
 
-type RuntimeRiskConfig = Pick<
-  RuntimeConfig,
-  | "runtimeProfile"
-  | "logLevel"
-  | "sqlitePath"
-  | "eventQueueCapacity"
-  | "maxQueueDepth"
-  | "maxReplayLag"
-  | "hotPathWarnMs"
-  | "maxExposureUsd"
-  | "maxRejectRate"
-  | "staleDataHaltMs"
-  | "latencyHaltMs"
-  | "maxDrawdownUsd"
-  | "idempotencyCacheSize"
-  | "paperFillSimulationEnabled"
-  | "paperFillSlippageBps"
-  | "telegramAlertsEnabled"
-  | "telegramBotToken"
-  | "telegramChatId"
-  | "telegramLanguage"
-  | "telegramAlertMode"
-  | "dryRun"
-  | "killSwitch"
-  | "liveTradingConfirmation"
-  | "allowMarketOrders"
-  | "binanceSymbols"
-  | "binanceUseTestnet"
-  | "binanceFuturesRestUrl"
-  | "binanceFuturesUserStreamBaseUrl"
-  | "binanceFuturesMarketWsBaseUrl"
-  | "binanceFuturesWsApiUrl"
-  | "maxOrderNotionalUsd"
-  | "maxDailyLossUsd"
-  | "maxLeverage"
-  | "binanceApiKey"
-  | "binanceApiSecret"
->;
+type RuntimeRiskConfig = RuntimeConfig;
 
 type RuntimeDeps = {
   config?: Partial<RuntimeConfigInput>;
@@ -239,6 +215,23 @@ export class TradingRuntime {
   private readonly submittedOrderKeys: BoundedIdSet<string>;
 
   private readonly liveOrderIds: BoundedIdSet<string>;
+  private readonly exchangeStateByKey = new Map<string, AuthoritativeState<Record<string, unknown>>>();
+  private readonly causalReorderBuffer: CausalReorderBuffer;
+  private readonly startupConfigEvidence: ConfigEvidenceBundle;
+  private readonly payloadTrustScorer = new PayloadTrustScorer();
+  private readonly processSurvivability = new ProcessSurvivabilityMonitor(DEFAULT_PROCESS_SURVIVABILITY_CONFIG);
+  private readonly restartCoordinator = new DeterministicRestartCoordinator(this.processSurvivability);
+  private readonly edgeAccounting = new EdgeAccountingLedger();
+  private causalUncertaintyCount = 0;
+  private confidenceDowngradeCount = 0;
+  private disputedTruth = false;
+  private unknownTruth = false;
+  private truthConfidence: TruthConfidenceState = truthConfidenceState({
+    causalUncertaintyCount: 0,
+    confidenceDowngradeCount: 0,
+    disputed: false,
+    unknown: false
+  });
 
   private readonly expectedPositions = new Map<string, number>();
 
@@ -308,6 +301,8 @@ export class TradingRuntime {
     this.seenEventIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.submittedOrderKeys = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.liveOrderIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
+    this.causalReorderBuffer = new CausalReorderBuffer(this.config.maxReorderWindowMs);
+    this.startupConfigEvidence = captureConfigEvidence(this.config, this.clock.nowMs());
     this.portfolio = deps?.portfolio ?? new PortfolioState();
     this.replay = deps?.replay ?? new ReplayEngine();
     this.risk = deps?.risk ?? new RiskEngine(this.config, this.portfolio);
@@ -341,7 +336,11 @@ export class TradingRuntime {
     this.auditDecision({
       action: "runtime_started",
       runtimeProfile: this.config.runtimeProfile,
-      limits: this.auditLimits()
+      limits: this.auditLimits(),
+      metrics: {
+        configFingerprint: this.startupConfigEvidence.fingerprint,
+        configEvidenceId: this.startupConfigEvidence.evidenceId
+      }
     });
     this.timer = setInterval(() => {
       this.reportRuntimeHealth();
@@ -407,6 +406,7 @@ export class TradingRuntime {
       });
       throw error;
     }
+    event = this.withIdempotencyContract(event);
 
     const bypassDuplicateChecks = this.canBypassDuplicateChecks(options);
     try {
@@ -415,8 +415,23 @@ export class TradingRuntime {
       this.auditDuplicateRejection(event, error instanceof Error ? error.message : "duplicate_event");
       throw error;
     }
+    this.assertConfigFingerprintValid("ingest");
+    const exchangeConflictDecision = await this.resolveExchangeAuthority(event);
+    if (exchangeConflictDecision === "rejected_lower_authority") {
+      this.auditDuplicateRejection(event, "lower_authority_conflict");
+      return event;
+    }
+    if (exchangeConflictDecision === "halt_required") {
+      this.saveCheckpoint();
+      return event;
+    }
 
     if (event.eventType === "INTENT_CREATED") {
+      const confidenceDecision = await this.applyTruthConfidenceOrderGovernance(event);
+      if (!confidenceDecision.allow) {
+        this.saveCheckpoint();
+        return event;
+      }
       try {
         this.assertOrderSubmissionIdempotent(event, bypassDuplicateChecks);
       } catch (error) {
@@ -511,6 +526,7 @@ export class TradingRuntime {
   }
 
   replayPersisted(fromSeq = 1, limit = 10_000): ReplayMismatch[] {
+    this.assertConfigFingerprintValid("replay");
     this.auditDecision({ action: "replay_started", seq: fromSeq });
     const previousMode = this.state.mode();
     try {
@@ -626,6 +642,120 @@ export class TradingRuntime {
     return this.paperPerformance.snapshot();
   }
 
+  observeProcessSurvivability(sample?: Partial<ProcessSurvivabilitySample>): ProcessSurvivabilityDecision {
+    const now = this.clock.nowMs();
+    const memory = process.memoryUsage();
+    const fullSample: ProcessSurvivabilitySample = {
+      timestamp: sample?.timestamp ?? now,
+      heapUsedBytes: sample?.heapUsedBytes ?? memory.heapUsed,
+      heapLimitBytes: sample?.heapLimitBytes ?? Math.max(memory.heapTotal, memory.heapUsed, 1),
+      gcPauseMs: sample?.gcPauseMs ?? 0,
+      windowMs: sample?.windowMs ?? TradingRuntime.HEALTH_REPORT_INTERVAL_MS,
+      asyncQueueDepth: sample?.asyncQueueDepth ?? this.events.size(),
+      asyncQueueCapacity: sample?.asyncQueueCapacity ?? this.config.eventQueueCapacity,
+      cpuOverheadRatio: sample?.cpuOverheadRatio ?? 0,
+      memoryOverheadRatio: sample?.memoryOverheadRatio ?? 0,
+      eventLoopLagMs: sample?.eventLoopLagMs ?? 0,
+      timerDriftMs: sample?.timerDriftMs ?? 0,
+      websocketProcessingLatencyMs: sample?.websocketProcessingLatencyMs ?? this.metrics.lastProcessingLatencyMs,
+      reconciliationLatencyMs: sample?.reconciliationLatencyMs ?? 0,
+      reconciliationBlockedMs: sample?.reconciliationBlockedMs ?? 0,
+      uptimeMs: sample?.uptimeMs ?? Math.floor(process.uptime() * 1_000),
+      restartReason: sample?.restartReason ?? "deterministic_cadence",
+      activeTrading: sample?.activeTrading ?? this.state.canSubmitOrders()
+    };
+    const decision = this.processSurvivability.observe("trading-runtime", fullSample, ["process_survivability_sample"]);
+    this.auditDecision({
+      action: "process_survivability_observed",
+      reason: decision.status,
+      value: decision.heapUtilization,
+      metrics: {
+        ...decision,
+        sample: fullSample
+      }
+    });
+    this.applyProcessSurvivabilityDecision(decision, fullSample);
+    if (decision.status === "DETERMINISTIC_RESTART_REQUIRED") {
+      const coordinated = this.restartCoordinator.coordinate({
+        runtimeId: "trading-runtime",
+        now,
+        context: {
+          openPositions: this.hasOpenPositions(),
+          disputedTruth: this.disputedTruth,
+          reconnectRecovery: this.metrics.liveExecutionDegraded,
+          degradedReconciliation: decision.reasons.includes("reconciliation_starvation"),
+          evidenceIds: ["restart_eligibility", "pre_restart_state"]
+        },
+        state: {
+          mode: this.state.mode(),
+          seq: this.seq,
+          configFingerprint: this.startupConfigEvidence.fingerprint,
+          checkpointSeq: this.checkpoints.latest()?.seq,
+          queueDepth: this.events.size()
+        }
+      });
+      this.auditDecision({
+        action: "deterministic_restart_coordinated",
+        reason: coordinated.reason,
+        metrics: {
+          eligible: coordinated.eligible,
+          blockedBy: coordinated.blockedBy,
+          evidenceHash: coordinated.evidenceHash,
+          preRestartEvidence: coordinated.preRestartEvidence
+        }
+      });
+      if (!coordinated.eligible) {
+        return decision;
+      }
+      const reverified = this.processSurvivability.verifyRestart(
+        "trading-runtime",
+        now,
+        this.configFingerprintCurrent() === this.startupConfigEvidence.fingerprint && this.checkpoints.latest() !== undefined,
+        ["config_fingerprint", "checkpoint_state"]
+      );
+      this.auditDecision({
+        action: "process_restart_reverified",
+        reason: reverified.status,
+        metrics: reverified as unknown as Record<string, unknown>
+      });
+      if (reverified.status !== "RESTART_REVERIFIED") {
+        this.enterSafeModeForRuntimeBreach("restart_reverification_failed");
+      }
+    }
+    return decision;
+  }
+
+  recordEdgeAttributionReport(input: EdgeAttributionInput): EdgeAccountingDecision {
+    const decision = this.edgeAccounting.record(input);
+    this.auditDecision({
+      action: "edge_attribution_report",
+      reason: decision.status,
+      value: decision.report.netRealizedEdgeBps,
+      metrics: {
+        report: decision.report,
+        violations: decision.violations,
+        consecutiveNonPositiveDays: decision.consecutiveNonPositiveDays,
+        evidenceHash: decision.evidenceHash,
+        marketEdgeBps: decision.report.strategyGrossEdgeBps,
+        runtimeEdgeBps: decision.report.executionQualityEdgeBps
+      }
+    });
+    if (decision.status === "ECONOMICALLY_UNVIABLE_REQUIRED") {
+      this.state.transition("ECONOMICALLY_UNVIABLE", ["negative_net_edge"]);
+      this.auditDecision({
+        action: "economically_unviable_entered",
+        reason: decision.violations.join(","),
+        value: decision.report.netRealizedEdgeBps,
+        metrics: {
+          reportId: decision.report.reportId,
+          consecutiveNonPositiveDays: decision.consecutiveNonPositiveDays,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+    }
+    return decision;
+  }
+
   connectBinanceMarketData(symbol: string): void {
     // TODO(runtime-boundary): move this Binance-specific compatibility bridge into adapter orchestration.
     // TradingRuntime should eventually depend only on RuntimeMarketDataAdapter and canonical EventInput.
@@ -695,7 +825,9 @@ export class TradingRuntime {
     if (input.eventType !== "MARKET_TICK" && input.eventType !== "BOOK_UPDATE") {
       throw new Error("external_market_event_type_invalid");
     }
-    await this.ingest(input);
+    const enveloped = this.withExchangeEnvelope(input);
+    this.assertPayloadTrusted(enveloped);
+    await this.ingestCausalExchangeEvent(enveloped);
   }
 
   async ingestBinanceLiveExecutionEvent(input: EventInput): Promise<void> {
@@ -711,7 +843,17 @@ export class TradingRuntime {
     ) {
       throw new Error("live_execution_event_type_invalid");
     }
-    await this.ingest(input);
+    const enveloped = this.withExchangeEnvelope(input);
+    this.assertPayloadTrusted(enveloped);
+    await this.ingestCausalExchangeEvent(enveloped);
+  }
+
+  async flushCausalExchangeEvents(): Promise<void> {
+    const drained = this.causalReorderBuffer.drain(this.clock.monotonicMs());
+    this.auditCausalUncertainty(drained.uncertainty);
+    for (const event of drained.ready) {
+      await this.ingest(event);
+    }
   }
 
   async handleLiveExecutionLifecycle(event: BinanceLiveExecutionLifecycleEvent): Promise<void> {
@@ -1489,6 +1631,7 @@ export class TradingRuntime {
 
   private reportRuntimeHealth(): void {
     this.flushEventStore();
+    this.observeProcessSurvivability();
     this.auditDecision({
       action: "runtime_health_report",
       metrics: this.healthSnapshot() as unknown as Record<string, unknown>
@@ -1529,8 +1672,373 @@ export class TradingRuntime {
       maxRejectRate: this.config.maxRejectRate,
       maxExposureUsd: this.config.maxExposureUsd,
       maxDrawdownUsd: this.config.maxDrawdownUsd,
-      idempotencyCacheSize: this.config.idempotencyCacheSize
+      idempotencyCacheSize: this.config.idempotencyCacheSize,
+      maxReorderWindowMs: this.config.maxReorderWindowMs,
+      clockSkewAlertMs: this.config.clockSkewAlertMs
     };
+  }
+
+  private applyProcessSurvivabilityDecision(decision: ProcessSurvivabilityDecision, sample: ProcessSurvivabilitySample): void {
+    if (decision.status === "LATENCY_ALERT") {
+      this.auditDecision({
+        action: "LATENCY_ALERT",
+        reason: "excessive_gc_pause_during_active_trading",
+        value: sample.gcPauseMs,
+        threshold: DEFAULT_PROCESS_SURVIVABILITY_CONFIG.maxGcPauseRatio,
+        metrics: {
+          gcPauseRatio: decision.gcPauseRatio,
+          rollingMetrics: decision.rollingMetrics,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+    }
+    if (decision.status === "PROCESS_DEGRADED") {
+      this.auditDecision({
+        action: "PROCESS_DEGRADED",
+        reason: "event_loop_blocked",
+        value: sample.eventLoopLagMs ?? 0,
+        threshold: DEFAULT_PROCESS_SURVIVABILITY_CONFIG.maxEventLoopLagMs,
+        metrics: {
+          reasons: decision.reasons,
+          rollingMetrics: decision.rollingMetrics,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+    }
+    if (decision.status === "SAFE_MODE_REQUIRED") {
+      this.auditDecision({
+        action: "PROCESS_DEGRADED",
+        reason: "reconciliation_starvation",
+        value: sample.reconciliationBlockedMs ?? 0,
+        threshold: DEFAULT_PROCESS_SURVIVABILITY_CONFIG.maxReconciliationBlockedMs,
+        metrics: {
+          reasons: decision.reasons,
+          rollingMetrics: decision.rollingMetrics,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+      this.risk.halt("reconciliation_starvation");
+      this.enterSafeModeForRuntimeBreach("reconciliation_starvation");
+    }
+    if (decision.status === "HALT_NEW_TRADING_REQUIRED") {
+      this.auditDecision({
+        action: "PROCESS_DEGRADED",
+        reason: "async_queue_explosion_halt_new_trading",
+        value: decision.queueUtilization,
+        threshold: DEFAULT_PROCESS_SURVIVABILITY_CONFIG.queueExplosionUtilization,
+        metrics: {
+          reasons: decision.reasons,
+          rollingMetrics: decision.rollingMetrics,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+      this.risk.halt("async_queue_explosion");
+      this.enterSafeModeForRuntimeBreach("async_queue_explosion");
+    }
+    if (decision.memoryLeakSuspected) {
+      this.auditDecision({
+        action: "PROCESS_DEGRADED",
+        reason: "memory_leak_suspected",
+        metrics: {
+          rollingMetrics: decision.rollingMetrics,
+          evidenceHash: decision.evidenceHash
+        }
+      });
+    }
+  }
+
+  private hasOpenPositions(): boolean {
+    for (const quantity of this.expectedPositions.values()) {
+      if (quantity !== 0) return true;
+    }
+    return false;
+  }
+
+  private assertPayloadTrusted(input: EventInput): void {
+    const assessment = this.payloadTrustScorer.assess(input);
+    this.auditDecision({
+      action: "payload_trust_assessed",
+      eventType: input.eventType,
+      correlationId: input.correlationId,
+      symbol: input.symbol,
+      value: assessment.trustScore,
+      reason: assessment.acceptanceDecision,
+      metrics: { flags: assessment.flags }
+    });
+    if (assessment.acceptanceDecision === "ACCEPT") return;
+    this.confidenceDowngradeCount += 1;
+    this.refreshTruthConfidence();
+    this.auditDecision({
+      action: "CONFIDENCE_DOWNGRADE",
+      eventType: input.eventType,
+      correlationId: input.correlationId,
+      symbol: input.symbol,
+      reason: `payload_trust_${assessment.acceptanceDecision.toLowerCase()}`,
+      value: assessment.trustScore,
+      metrics: { flags: assessment.flags }
+    });
+    if (assessment.acceptanceDecision === "QUARANTINE") {
+      this.disputedTruth = true;
+      this.refreshTruthConfidence();
+      throw new Error(`payload_quarantined:${assessment.flags.join(",")}`);
+    }
+    this.unknownTruth = true;
+    this.refreshTruthConfidence();
+    this.enterSafeModeForRuntimeBreach("payload_trust_rejected");
+    throw new Error(`payload_rejected:${assessment.flags.join(",")}`);
+  }
+
+  private withExchangeEnvelope(input: EventInput): EventInput {
+    const receivedAt = input.receiveTimestamp ?? this.clock.nowMs();
+    const exchangeTimestamp = input.exchangeTimestamp ?? input.timestamp ?? receivedAt;
+    const sequenceId = this.sequenceIdFromPayload(input.payload) ?? input.seq ?? exchangeTimestamp;
+    return {
+      ...input,
+      eventId: input.eventId ?? `${input.source}:${input.eventType}:${input.symbol}:${input.correlationId}:${sequenceId}`,
+      timestamp: input.timestamp ?? receivedAt,
+      exchangeTimestamp,
+      receiveTimestamp: receivedAt,
+      processingTimestamp: input.processingTimestamp ?? receivedAt,
+      payload: {
+        ...input.payload,
+        sequence_id: sequenceId
+      }
+    };
+  }
+
+  private async ingestCausalExchangeEvent(input: EventInput): Promise<void> {
+    this.assertExchangeEventTimeSemantics(input);
+    this.observeClockSkew(input);
+    const enriched = this.withCausalPayload(input);
+    const drained = this.causalReorderBuffer.push(enriched, this.clock.monotonicMs());
+    this.auditCausalUncertainty(drained.uncertainty);
+    for (const event of drained.ready) {
+      await this.ingest(event);
+    }
+  }
+
+  private assertExchangeEventTimeSemantics(input: EventInput): void {
+    if (input.exchangeTimestamp === undefined) {
+      this.auditDecision({
+        action: "CAUSAL_UNCERTAINTY",
+        eventType: input.eventType,
+        correlationId: input.correlationId,
+        symbol: input.symbol,
+        reason: "missing_exchange_time"
+      });
+    }
+    if (input.receiveTimestamp === undefined) {
+      throw new Error("received_time_required");
+    }
+  }
+
+  private withCausalPayload(input: EventInput): EventInput {
+    const receivedTime = input.receiveTimestamp ?? this.clock.nowMs();
+    const sequenceId = this.sequenceIdFromPayload(input.payload);
+    return {
+      ...input,
+      receiveTimestamp: receivedTime,
+      payload: {
+        ...input.payload,
+        exchange_time: input.exchangeTimestamp ?? input.timestamp ?? receivedTime,
+        received_time: receivedTime,
+        received_time_monotonic_ms: this.clock.monotonicMs(),
+        ...(sequenceId === undefined ? {} : { sequence_id: sequenceId })
+      }
+    };
+  }
+
+  private observeClockSkew(input: EventInput): void {
+    if (input.exchangeTimestamp === undefined || input.receiveTimestamp === undefined) return;
+    const skew = Math.abs(input.receiveTimestamp - input.exchangeTimestamp);
+    if (skew <= this.config.clockSkewAlertMs) return;
+    this.auditDecision({
+      action: "CLOCK_SKEW_ALERT",
+      eventType: input.eventType,
+      correlationId: input.correlationId,
+      symbol: input.symbol,
+      value: skew,
+      threshold: this.config.clockSkewAlertMs,
+      reason: "exchange_local_clock_skew"
+    });
+  }
+
+  private auditCausalUncertainty(uncertainty: readonly { eventId: string; reason: string }[]): void {
+    for (const issue of uncertainty) {
+      this.causalUncertaintyCount += 1;
+      this.auditDecision({
+        action: "CAUSAL_UNCERTAINTY",
+        correlationId: issue.eventId,
+        reason: issue.reason
+      });
+      this.auditDecision({
+        action: "CONFIDENCE_DOWNGRADE",
+        correlationId: issue.eventId,
+        reason: "causal_order_uncertain"
+      });
+    }
+    if (uncertainty.length > 0) this.refreshTruthConfidence();
+  }
+
+  private async resolveExchangeAuthority(event: RuntimeEvent): Promise<"accepted" | "rejected_lower_authority" | "halt_required"> {
+    if (event.source !== "binance_user_ws") return "accepted";
+    const current = this.exchangeAuthoritativeState(event);
+    const key = this.exchangeStateKey(event);
+    const previous = this.exchangeStateByKey.get(key);
+    if (previous === undefined) {
+      this.exchangeStateByKey.set(key, current);
+      return "accepted";
+    }
+
+    const resolved = resolveConflict(previous, current, this.audit);
+    if (resolved.status === "HALT_REQUIRED") {
+      this.disputedTruth = true;
+      this.refreshTruthConfidence();
+      const reason = resolved.reason;
+      this.risk.halt(reason);
+      this.state.transition("GOVERNANCE_HALT", resolved.evidenceIds);
+      this.auditDecision({
+        action: "governance_halt_entered",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        symbol: event.symbol,
+        reason,
+        metrics: { evidenceIds: resolved.evidenceIds }
+      });
+      return "halt_required";
+    }
+
+    this.exchangeStateByKey.set(key, {
+      authority: resolved.selectedAuthority,
+      state: resolved.state,
+      evidenceId: resolved.evidenceIds.at(-1) ?? current.evidenceId,
+      observedAt: current.observedAt
+    });
+    if (resolved.selectedAuthority !== current.authority && resolved.downgradedAuthority === current.authority) {
+      this.confidenceDowngradeCount += 1;
+      this.refreshTruthConfidence();
+      return "rejected_lower_authority";
+    }
+    return "accepted";
+  }
+
+  private exchangeAuthoritativeState(event: RuntimeEvent): AuthoritativeState {
+    return {
+      authority: authorityForExchangeEvent(event) as ExchangeAuthority,
+      state: this.exchangeComparableState(event),
+      evidenceId: event.eventId ?? `${event.eventType}:${event.seq}`,
+      observedAt: event.exchangeTimestamp ?? event.timestamp
+    };
+  }
+
+  private exchangeComparableState(event: RuntimeEvent): Record<string, unknown> {
+    return {
+      symbol: event.symbol,
+      orderId: event.payload.orderId,
+      orderClientId: event.payload.orderClientId ?? event.payload.clientOrderId,
+      status: event.payload.status,
+      quantity: event.payload.quantity,
+      price: event.payload.price,
+      positionQuantity: event.payload.positionQuantity
+    };
+  }
+
+  private exchangeStateKey(event: RuntimeEvent): string {
+    const orderId = event.payload.orderId ?? event.payload.orderClientId ?? event.payload.clientOrderId;
+    return `${event.symbol}:${String(orderId ?? event.correlationId)}`;
+  }
+
+  private assertConfigFingerprintValid(context: "ingest" | "replay"): void {
+    const current = this.configFingerprintCurrent();
+    if (current === this.startupConfigEvidence.fingerprint) return;
+    this.auditDecision({
+      action: "CONFIG_DRIFT_DETECTED",
+      reason: context,
+      metrics: {
+        expectedConfigFingerprint: this.startupConfigEvidence.fingerprint,
+        actualConfigFingerprint: current,
+        configEvidenceId: this.startupConfigEvidence.evidenceId
+      }
+    });
+    throw new Error(`config_drift_detected:${context}`);
+  }
+
+  private configFingerprintCurrent(): string {
+    return configFingerprint(this.config);
+  }
+
+  private withIdempotencyContract(event: RuntimeEvent): RuntimeEvent {
+    if (event.eventType !== "INTENT_CREATED" && event.eventType !== "ORDER_SUBMITTED") return event;
+    if (typeof event.payload.idempotencyKey === "string" && event.payload.idempotencyKey.length > 0) return event;
+    return RuntimeEventSchema.parse({
+      ...event,
+      payload: {
+        ...event.payload,
+        idempotencyKey: this.orderSubmissionKey(event)
+      }
+    });
+  }
+
+  private async applyTruthConfidenceOrderGovernance(event: RuntimeEvent): Promise<RiskDecision> {
+    this.refreshTruthConfidence();
+    this.auditDecision({
+      action: "truth_confidence_evaluated",
+      seq: event.seq,
+      eventType: event.eventType,
+      correlationId: event.correlationId,
+      symbol: event.symbol,
+      reason: this.truthConfidence.reason,
+      value: this.truthConfidence.positionSizeMultiplier,
+      metrics: {
+        confidence: this.truthConfidence.confidence,
+        haltNewOrders: this.truthConfidence.haltNewOrders
+      }
+    });
+    if (this.truthConfidence.enterSafeMode) {
+      await this.enterSafeMode(event, "unknown_truth_state");
+      return { allow: false, reason: "unknown_truth_state" };
+    }
+    if (this.truthConfidence.haltNewOrders) {
+      this.auditDecision({
+        action: "event_rejected",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        symbol: event.symbol,
+        reason: "disputed_truth_halts_new_orders"
+      });
+      return { allow: false, reason: "disputed_truth_halts_new_orders" };
+    }
+    if (this.truthConfidence.positionSizeMultiplier < 1 && typeof event.payload.quantity === "number") {
+      const reducedQuantity = event.payload.quantity * this.truthConfidence.positionSizeMultiplier;
+      event.payload.quantity = reducedQuantity;
+      this.auditDecision({
+        action: "position_size_reduced",
+        seq: event.seq,
+        eventType: event.eventType,
+        correlationId: event.correlationId,
+        symbol: event.symbol,
+        value: reducedQuantity,
+        reason: "degraded_truth_confidence"
+      });
+    }
+    return { allow: true };
+  }
+
+  private refreshTruthConfidence(): void {
+    this.truthConfidence = truthConfidenceState({
+      causalUncertaintyCount: this.causalUncertaintyCount,
+      confidenceDowngradeCount: this.confidenceDowngradeCount,
+      disputed: this.disputedTruth,
+      unknown: this.unknownTruth
+    });
+  }
+
+  private sequenceIdFromPayload(payload: Record<string, unknown>): number | undefined {
+    const value = payload.sequence_id ?? payload.sequenceId ?? payload.updateId ?? payload.tradeId;
+    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
   }
 
   private canBypassDuplicateChecks(options: IngestOptions): boolean {

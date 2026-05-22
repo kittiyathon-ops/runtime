@@ -22,7 +22,9 @@ const RuntimeLimitsSchema = z.object({
   maxRejectRate: z.coerce.number().min(0).max(1),
   maxExposureUsd: z.coerce.number().positive(),
   maxDrawdownUsd: z.coerce.number().positive(),
-  idempotencyCacheSize: z.coerce.number().int().positive()
+  idempotencyCacheSize: z.coerce.number().int().positive(),
+  maxReorderWindowMs: z.coerce.number().int().nonnegative(),
+  clockSkewAlertMs: z.coerce.number().int().positive()
 });
 
 const ResolvedRuntimeLimitsSchema = z.object({
@@ -35,7 +37,9 @@ const ResolvedRuntimeLimitsSchema = z.object({
   maxRejectRate: z.number().min(0).max(1),
   maxExposureUsd: z.number().positive(),
   maxDrawdownUsd: z.number().positive(),
-  idempotencyCacheSize: z.number().int().positive()
+  idempotencyCacheSize: z.number().int().positive(),
+  maxReorderWindowMs: z.number().int().nonnegative(),
+  clockSkewAlertMs: z.number().int().positive()
 });
 
 export type RuntimeProfile = z.infer<typeof RuntimeProfileSchema>;
@@ -52,7 +56,9 @@ export const RUNTIME_PROFILE_LIMITS: Record<RuntimeProfile, RuntimeLimits> = {
     maxRejectRate: 0.2,
     maxExposureUsd: 10_000,
     maxDrawdownUsd: 1_000,
-    idempotencyCacheSize: 10_000
+    idempotencyCacheSize: 10_000,
+    maxReorderWindowMs: 250,
+    clockSkewAlertMs: 1_000
   },
   PAPER: {
     eventQueueCapacity: 25_000,
@@ -64,7 +70,9 @@ export const RUNTIME_PROFILE_LIMITS: Record<RuntimeProfile, RuntimeLimits> = {
     maxRejectRate: 0.1,
     maxExposureUsd: 5_000,
     maxDrawdownUsd: 500,
-    idempotencyCacheSize: 25_000
+    idempotencyCacheSize: 25_000,
+    maxReorderWindowMs: 200,
+    clockSkewAlertMs: 750
   },
   LIVE: {
     eventQueueCapacity: 25_000,
@@ -76,7 +84,9 @@ export const RUNTIME_PROFILE_LIMITS: Record<RuntimeProfile, RuntimeLimits> = {
     maxRejectRate: 0.05,
     maxExposureUsd: 1_000,
     maxDrawdownUsd: 100,
-    idempotencyCacheSize: 50_000
+    idempotencyCacheSize: 50_000,
+    maxReorderWindowMs: 100,
+    clockSkewAlertMs: 500
   },
   REPLAY: {
     eventQueueCapacity: 50_000,
@@ -88,7 +98,9 @@ export const RUNTIME_PROFILE_LIMITS: Record<RuntimeProfile, RuntimeLimits> = {
     maxRejectRate: 0.5,
     maxExposureUsd: 100_000,
     maxDrawdownUsd: 100_000,
-    idempotencyCacheSize: 100_000
+    idempotencyCacheSize: 100_000,
+    maxReorderWindowMs: 0,
+    clockSkewAlertMs: 10_000
   },
   SAFE: {
     eventQueueCapacity: 1_000,
@@ -100,7 +112,9 @@ export const RUNTIME_PROFILE_LIMITS: Record<RuntimeProfile, RuntimeLimits> = {
     maxRejectRate: 0.05,
     maxExposureUsd: 1_000,
     maxDrawdownUsd: 100,
-    idempotencyCacheSize: 1_000
+    idempotencyCacheSize: 1_000,
+    maxReorderWindowMs: 50,
+    clockSkewAlertMs: 250
   }
 };
 
@@ -123,6 +137,8 @@ const RawConfigSchema = z.object({
   maxLeverage: z.coerce.number().positive().default(1),
   maxDrawdownUsd: z.coerce.number().positive().optional(),
   idempotencyCacheSize: z.coerce.number().int().positive().optional(),
+  maxReorderWindowMs: z.coerce.number().int().nonnegative().optional(),
+  clockSkewAlertMs: z.coerce.number().int().positive().optional(),
   paperFillSimulationEnabled: z.boolean().default(false),
   paperFillSlippageBps: z.coerce.number().nonnegative().default(0),
   telegramAlertsEnabled: z.boolean().default(false),
@@ -160,6 +176,8 @@ export const ConfigSchema = RawConfigSchema.transform((config) => {
     maxExposureUsd: config.maxExposureUsd ?? profileLimits.maxExposureUsd,
     maxDrawdownUsd: config.maxDrawdownUsd ?? profileLimits.maxDrawdownUsd,
     idempotencyCacheSize: config.idempotencyCacheSize ?? profileLimits.idempotencyCacheSize,
+    maxReorderWindowMs: config.maxReorderWindowMs ?? profileLimits.maxReorderWindowMs,
+    clockSkewAlertMs: config.clockSkewAlertMs ?? profileLimits.clockSkewAlertMs,
     binanceFuturesRestUrl: config.binanceFuturesRestUrl ?? (config.binanceUseTestnet ? BINANCE_FUTURES_TESTNET_REST_URL : BINANCE_FUTURES_PRODUCTION_REST_URL),
     binanceFuturesUserStreamBaseUrl: config.binanceFuturesUserStreamBaseUrl ?? (config.binanceUseTestnet ? BINANCE_FUTURES_TESTNET_USER_STREAM_BASE_URL : BINANCE_FUTURES_PRODUCTION_USER_STREAM_BASE_URL),
     binanceFuturesMarketWsBaseUrl: config.binanceFuturesMarketWsBaseUrl ?? (config.binanceUseTestnet ? BINANCE_FUTURES_TESTNET_MARKET_WS_BASE_URL : BINANCE_FUTURES_PRODUCTION_MARKET_WS_BASE_URL),
@@ -243,6 +261,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     maxLeverage: env.MAX_LEVERAGE,
     maxDrawdownUsd: env.MAX_DRAWDOWN_USD,
     idempotencyCacheSize: env.IDEMPOTENCY_CACHE_SIZE,
+    maxReorderWindowMs: env.MAX_REORDER_WINDOW_MS,
+    clockSkewAlertMs: env.CLOCK_SKEW_ALERT_MS,
     paperFillSimulationEnabled: env.PAPER_FILL_SIMULATION_ENABLED === "true",
     paperFillSlippageBps: env.PAPER_FILL_SLIPPAGE_BPS,
     telegramAlertsEnabled: env.TELEGRAM_ALERTS_ENABLED === "true",

@@ -4,7 +4,16 @@ import type { RiskEngine } from "../risk/risk-engine.js";
 import type { ExecutionPlan, OrderIntent } from "./order.js";
 import { estimateSlippageBps } from "./slippage.js";
 
-export type ExecutionMode = "NORMAL" | "PAPER" | "REPLAY" | "SAFE_MODE" | "HIBERNATION_MODE" | "GOVERNANCE_HALT" | "STOPPING" | "HALTED";
+export type ExecutionMode =
+  | "NORMAL"
+  | "PAPER"
+  | "REPLAY"
+  | "SAFE_MODE"
+  | "HIBERNATION_MODE"
+  | "GOVERNANCE_HALT"
+  | "ECONOMICALLY_UNVIABLE"
+  | "STOPPING"
+  | "HALTED";
 
 export interface ExecutionResult {
   accepted: boolean;
@@ -20,7 +29,13 @@ export class ExecutionEngine {
     nextSeq: () => number,
     nowMs: number
   ): ExecutionResult {
-    if (mode === "SAFE_MODE" || mode === "HIBERNATION_MODE" || mode === "GOVERNANCE_HALT" || mode === "HALTED") {
+    if (
+      mode === "SAFE_MODE" ||
+      mode === "HIBERNATION_MODE" ||
+      mode === "GOVERNANCE_HALT" ||
+      mode === "ECONOMICALLY_UNVIABLE" ||
+      mode === "HALTED"
+    ) {
       return { accepted: false, events: [] };
     }
 

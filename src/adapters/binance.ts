@@ -85,6 +85,7 @@ export function normalizeBinanceMarketPayload(
       payload: {
         stream,
         updateId: requireNumberLike(payload, "u"),
+        sequence_id: requireNumberLike(payload, "u"),
         bidPrice: requireNumberLike(payload, "b"),
         bidQuantity: requireNumberLike(payload, "B"),
         askPrice: requireNumberLike(payload, "a"),
@@ -110,6 +111,7 @@ export function normalizeBinanceMarketPayload(
       payload: {
         stream,
         tradeId: requireNumberLike(payload, "t"),
+        sequence_id: requireNumberLike(payload, "t"),
         price: requireNumberLike(payload, "p"),
         quantity,
         volume: quantity,
@@ -132,6 +134,7 @@ export function normalizeBinanceMarketPayload(
     causationId: "exchange",
     payload: {
       stream,
+      sequence_id: optionalTimestamp(payload, "E"),
       markPrice: requireNumberLike(payload, "p"),
       indexPrice: requireNumberLike(payload, "i"),
       estimatedSettlePrice: requireNumberLike(payload, "P"),
