@@ -12,3 +12,21 @@ replays/
 *.sqlite
 data/*.sqlite
 *.db
+
+# --- Secret / Environment Protection ---
+.env
+.env.*
+!.env.example
+
+# --- Local runtime data ---
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# --- Logs / generated artifacts ---
+*.log
+dist/
+coverage/
+node_modules/
