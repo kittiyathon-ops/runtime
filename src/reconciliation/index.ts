@@ -29,3 +29,9 @@ export {
   type ReconciliationGovernanceBridgeInput,
   type ReconciliationGovernanceBridgeResult
 } from "./reconciliation-governance-bridge.js";
+
+export {
+  certifyRuntimeStartup,
+  type RuntimeStartupCertificationInput,
+  type RuntimeStartupCertificationResult
+} from "./runtime-startup-certification-service.js";

@@ -9,6 +9,7 @@ import { TradingRuntime } from "./runtime/runtime.js";
 import { GovernanceStateMachine } from "./runtime/governance-state-machine.js";
 import type { RuntimeSessionLock } from "./infra/RuntimeSessionLock.js";
 import { StartupTruthReconciler } from "./core/StartupTruthReconciler.js";
+import { certifyRuntimeStartup } from "./reconciliation/index.js";
 
 export type DeploymentMode = "SHADOW" | "PAPER" | "CONSTRAINED" | "LIVE";
 
@@ -346,3 +347,4 @@ export async function startProductionRuntime(): Promise<OperationalBootstrap> {
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await startProductionRuntime();
 }
+
