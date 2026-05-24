@@ -1,15 +1,5 @@
-export type Trend =
-  | "LONG"
-  | "SHORT"
-  | "NEUTRAL";
-
-export type Regime =
-  | "TREND"
-  | "RANGE"
-  | "CHOP"
-  | "SQUEEZE"
-  | "PANIC"
-  | "UNKNOWN";
+export type Trend = "LONG" | "SHORT" | "NEUTRAL";
+export type Regime = "TREND" | "RANGE" | "CHOP" | "SQUEEZE" | "PANIC" | "UNKNOWN";
 
 export interface ScoreDetail {
   score: number;
@@ -19,19 +9,14 @@ export interface ScoreDetail {
 
 export interface ConfluenceScoreInput {
   regime: Regime;
-
   btcTrend: Trend;
   ethTrend: Trend;
-
   volume: number;
   avgVolume: number;
-
   liquiditySweep: boolean;
   reclaimDetected: boolean;
-
   spreadBps: number;
   volatilityBps: number;
-
   failedSignals: number;
 }
 
@@ -41,19 +26,13 @@ export interface HardVetoResult {
 }
 
 export interface ConfluenceScoreResult {
-
   total: number;
-
   threshold: number;
-
   maxScore: number;
-
   tradeWorthy: boolean;
-
   missingPoints: number;
-
   hardVeto: HardVetoResult;
-
+  biasMode: "SHORT_FAVORABLE" | "LONG_STRICT" | "NEUTRAL";
   details: {
     regimeOK: ScoreDetail;
     btcEthAlign: ScoreDetail;
@@ -63,470 +42,150 @@ export interface ConfluenceScoreResult {
     volatilityAcceptable: ScoreDetail;
     noFailedStreak: ScoreDetail;
   };
-
   suggestions: string[];
 }
 
 export class EthConfluenceScoreCalculator {
-
-  private readonly threshold = 7;
-
   private readonly maxScore = 11;
 
-  calculate(
-    input: ConfluenceScoreInput
-  ): ConfluenceScoreResult {
-
+  calculate(input: ConfluenceScoreInput): ConfluenceScoreResult {
     const details = {
-
-      regimeOK:
-        this.regimeOK(
-          input.regime
-        ),
-
-      btcEthAlign:
-        this.btcEthAlign(
-          input.btcTrend,
-          input.ethTrend
-        ),
-
-      volumeConfirm:
-        this.volumeConfirm(
-          input.volume,
-          input.avgVolume
-        ),
-
-      sweepReclaim:
-        this.sweepReclaim(
-          input.liquiditySweep,
-          input.reclaimDetected
-        ),
-
-      spreadHealthy:
-        this.spreadHealthy(
-          input.spreadBps
-        ),
-
-      volatilityAcceptable:
-        this.volatilityAcceptable(
-          input.volatilityBps
-        ),
-
-      noFailedStreak:
-        this.noFailedStreak(
-          input.failedSignals
-        )
+      regimeOK: this.regimeOK(input.regime),
+      btcEthAlign: this.btcEthAlign(input.btcTrend, input.ethTrend),
+      volumeConfirm: this.volumeConfirm(input.volume, input.avgVolume),
+      sweepReclaim: this.sweepReclaim(input.liquiditySweep, input.reclaimDetected),
+      spreadHealthy: this.spreadHealthy(input.spreadBps),
+      volatilityAcceptable: this.volatilityAcceptable(input.volatilityBps),
+      noFailedStreak: this.noFailedStreak(input.failedSignals)
     };
 
-    const total =
-      Object.values(details)
-        .reduce(
-          (sum, item) =>
-            sum + item.score,
-          0
-        );
-
-    const missingPoints =
-      Math.max(
-        0,
-        this.threshold - total
-      );
-
-    const hardVeto =
-      this.hardVeto(
-        input,
-        details
-      );
+    const total = Object.values(details).reduce((sum, item) => sum + item.score, 0);
+    const biasMode = this.biasMode(details.btcEthAlign.status);
+    const threshold = this.thresholdForBias(biasMode);
+    const hardVeto = this.hardVeto(input, details, biasMode);
 
     return {
-
       total,
-
-      threshold:
-        this.threshold,
-
-      maxScore:
-        this.maxScore,
-
-      tradeWorthy:
-        total >= this.threshold &&
-        !hardVeto.blocked,
-
-      missingPoints,
-
+      threshold,
+      maxScore: this.maxScore,
+      tradeWorthy: total >= threshold && !hardVeto.blocked,
+      missingPoints: Math.max(0, threshold - total),
       hardVeto,
-
+      biasMode,
       details,
-
-      suggestions:
-        this.suggestions(
-          details
-        )
+      suggestions: this.suggestions(details)
     };
   }
 
-  private regimeOK(
-    regime: Regime
-  ): ScoreDetail {
-
-    if (
-      regime === "TREND" ||
-      regime === "RANGE"
-    ) {
-
-      return {
-        score: 2,
-        maxScore: 2,
-        status: regime
-      };
-    }
-
-    if (
-      regime === "SQUEEZE"
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 2,
-        status: regime
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 2,
-      status: regime
-    };
+  private biasMode(status: string): "SHORT_FAVORABLE" | "LONG_STRICT" | "NEUTRAL" {
+    if (status === "SHORT_ALIGNED") return "SHORT_FAVORABLE";
+    if (status === "LONG_ALIGNED") return "LONG_STRICT";
+    return "NEUTRAL";
   }
 
-  private btcEthAlign(
-    btc: Trend,
-    eth: Trend
-  ): ScoreDetail {
-
-    if (
-      btc !== "NEUTRAL" &&
-      btc === eth
-    ) {
-
-      return {
-        score: 2,
-        maxScore: 2,
-        status:
-          `${btc}_ALIGNED`
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 2,
-      status:
-        `BTC_${btc}_ETH_${eth}`
-    };
+  private thresholdForBias(biasMode: "SHORT_FAVORABLE" | "LONG_STRICT" | "NEUTRAL"): number {
+    if (biasMode === "SHORT_FAVORABLE") return 7;
+    if (biasMode === "LONG_STRICT") return 9;
+    return 7;
   }
 
-  private volumeConfirm(
-    volume: number,
-    avgVolume: number
-  ): ScoreDetail {
-
-    if (
-      avgVolume <= 0
-    ) {
-
-      return {
-        score: 0,
-        maxScore: 2,
-        status:
-          "NO_VOLUME_AVG"
-      };
-    }
-
-    const ratio =
-      volume / avgVolume;
-
-    if (
-      ratio >= 1.5
-    ) {
-
-      return {
-        score: 2,
-        maxScore: 2,
-        status:
-          `STRONG_${ratio.toFixed(2)}x`
-      };
-    }
-
-    if (
-      ratio >= 1.0
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 2,
-        status:
-          `NORMAL_${ratio.toFixed(2)}x`
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 2,
-      status:
-        `WEAK_${ratio.toFixed(2)}x`
-    };
+  private regimeOK(regime: Regime): ScoreDetail {
+    if (regime === "TREND" || regime === "RANGE") return { score: 2, maxScore: 2, status: regime };
+    if (regime === "SQUEEZE") return { score: 1, maxScore: 2, status: regime };
+    return { score: 0, maxScore: 2, status: regime };
   }
 
-  private sweepReclaim(
-    liquiditySweep: boolean,
-    reclaimDetected: boolean
-  ): ScoreDetail {
-
-    if (
-      liquiditySweep &&
-      reclaimDetected
-    ) {
-
-      return {
-        score: 2,
-        maxScore: 2,
-        status: "DETECTED"
-      };
-    }
-
-    if (
-      reclaimDetected
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 2,
-        status:
-          "RECLAIM_ONLY"
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 2,
-      status:
-        "NOT_DETECTED"
-    };
+  private btcEthAlign(btc: Trend, eth: Trend): ScoreDetail {
+    if (btc !== "NEUTRAL" && btc === eth) return { score: 2, maxScore: 2, status: `${btc}_ALIGNED` };
+    return { score: 0, maxScore: 2, status: `BTC_${btc}_ETH_${eth}` };
   }
 
-  private spreadHealthy(
-    spreadBps: number
-  ): ScoreDetail {
+  private volumeConfirm(volume: number, avgVolume: number): ScoreDetail {
+    if (avgVolume <= 0) return { score: 0, maxScore: 2, status: "NO_VOLUME_AVG" };
 
+    const ratio = volume / avgVolume;
+
+    if (ratio >= 1.5) return { score: 2, maxScore: 2, status: `STRONG_${ratio.toFixed(2)}x` };
+    if (ratio >= 1.0) return { score: 1, maxScore: 2, status: `NORMAL_${ratio.toFixed(2)}x` };
+
+    return { score: 0, maxScore: 2, status: `WEAK_${ratio.toFixed(2)}x` };
+  }
+
+  private sweepReclaim(liquiditySweep: boolean, reclaimDetected: boolean): ScoreDetail {
+    if (liquiditySweep && reclaimDetected) return { score: 2, maxScore: 2, status: "DETECTED" };
+    if (reclaimDetected) return { score: 1, maxScore: 2, status: "RECLAIM_ONLY" };
+    return { score: 0, maxScore: 2, status: "NOT_DETECTED" };
+  }
+
+  private spreadHealthy(spreadBps: number): ScoreDetail {
     const threshold = 5;
-
-    if (
-      spreadBps <= threshold
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 1,
-        status:
-          `${spreadBps.toFixed(4)}bps`
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 1,
-      status:
-        `${spreadBps.toFixed(4)}bps_TOO_WIDE`
-    };
+    if (spreadBps <= threshold) return { score: 1, maxScore: 1, status: `${spreadBps.toFixed(4)}bps` };
+    return { score: 0, maxScore: 1, status: `${spreadBps.toFixed(4)}bps_TOO_WIDE` };
   }
 
-  private volatilityAcceptable(
-    volatilityBps: number
-  ): ScoreDetail {
-
+  private volatilityAcceptable(volatilityBps: number): ScoreDetail {
     const threshold = 250;
-
-    if (
-      volatilityBps <= threshold
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 1,
-        status:
-          `${volatilityBps.toFixed(2)}bps`
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 1,
-      status:
-        `${volatilityBps.toFixed(2)}bps_TOO_HIGH`
-    };
+    if (volatilityBps <= threshold) return { score: 1, maxScore: 1, status: `${volatilityBps.toFixed(2)}bps` };
+    return { score: 0, maxScore: 1, status: `${volatilityBps.toFixed(2)}bps_TOO_HIGH` };
   }
 
-  private noFailedStreak(
-    failedSignals: number
-  ): ScoreDetail {
-
-    if (
-      failedSignals < 3
-    ) {
-
-      return {
-        score: 1,
-        maxScore: 1,
-        status:
-          `CLEAN_${failedSignals}`
-      };
-    }
-
-    return {
-      score: 0,
-      maxScore: 1,
-      status:
-        `FAILED_${failedSignals}`
-    };
+  private noFailedStreak(failedSignals: number): ScoreDetail {
+    if (failedSignals < 3) return { score: 1, maxScore: 1, status: `CLEAN_${failedSignals}` };
+    return { score: 0, maxScore: 1, status: `FAILED_${failedSignals}` };
   }
 
   private hardVeto(
     input: ConfluenceScoreInput,
-    details: ConfluenceScoreResult["details"]
+    details: ConfluenceScoreResult["details"],
+    biasMode: "SHORT_FAVORABLE" | "LONG_STRICT" | "NEUTRAL"
   ): HardVetoResult {
-
     const reasons: string[] = [];
 
     const volumeRatio =
       input.avgVolume > 0
-        ? input.volume /
-          input.avgVolume
+        ? input.volume / input.avgVolume
         : 0;
 
-    if (
-      input.regime ===
-        "SQUEEZE" &&
-      volumeRatio < 0.5
-    ) {
-
-      reasons.push(
-        `LOW_VOLUME_SQUEEZE_${volumeRatio.toFixed(2)}x`
-      );
+    if (input.regime === "SQUEEZE" && volumeRatio < 0.5) {
+      reasons.push(`LOW_VOLUME_SQUEEZE_${volumeRatio.toFixed(2)}x`);
     }
 
-    if (
-      details.volumeConfirm
-        .score === 0
-    ) {
-
-      reasons.push(
-        `VOLUME_CONFIRM_FAILED_${details.volumeConfirm.status}`
-      );
+    if (details.volumeConfirm.score === 0) {
+      reasons.push(`VOLUME_CONFIRM_FAILED_${details.volumeConfirm.status}`);
     }
 
-    if (
-      details.spreadHealthy
-        .score === 0
-    ) {
-
-      reasons.push(
-        `SPREAD_UNHEALTHY_${details.spreadHealthy.status}`
-      );
+    if (biasMode === "LONG_STRICT" && details.volumeConfirm.score < 1) {
+      reasons.push(`LONG_REQUIRES_VOLUME_CONFIRM_${details.volumeConfirm.status}`);
     }
 
-    if (
-      details.noFailedStreak
-        .score === 0
-    ) {
+    if (biasMode === "LONG_STRICT" && input.regime === "SQUEEZE") {
+      reasons.push("LONG_BLOCKED_IN_SQUEEZE");
+    }
 
-      reasons.push(
-        `FAILED_STREAK_${details.noFailedStreak.status}`
-      );
+    if (details.spreadHealthy.score === 0) {
+      reasons.push(`SPREAD_UNHEALTHY_${details.spreadHealthy.status}`);
+    }
+
+    if (details.noFailedStreak.score === 0) {
+      reasons.push(`FAILED_STREAK_${details.noFailedStreak.status}`);
     }
 
     return {
-      blocked:
-        reasons.length > 0,
+      blocked: reasons.length > 0,
       reasons
     };
   }
 
-  private suggestions(
-    details:
-      ConfluenceScoreResult["details"]
-  ): string[] {
-
+  private suggestions(details: ConfluenceScoreResult["details"]): string[] {
     const out: string[] = [];
 
-    if (
-      details.regimeOK.score <
-      details.regimeOK.maxScore
-    ) {
-
-      out.push(
-        `wait for better regime: ${details.regimeOK.status}`
-      );
-    }
-
-    if (
-      details.btcEthAlign.score <
-      details.btcEthAlign.maxScore
-    ) {
-
-      out.push(
-        `wait for BTC/ETH alignment: ${details.btcEthAlign.status}`
-      );
-    }
-
-    if (
-      details.volumeConfirm.score <
-      details.volumeConfirm.maxScore
-    ) {
-
-      out.push(
-        `wait for stronger volume: ${details.volumeConfirm.status}`
-      );
-    }
-
-    if (
-      details.sweepReclaim.score <
-      details.sweepReclaim.maxScore
-    ) {
-
-      out.push(
-        `wait for sweep + reclaim: ${details.sweepReclaim.status}`
-      );
-    }
-
-    if (
-      details.spreadHealthy.score <
-      details.spreadHealthy.maxScore
-    ) {
-
-      out.push(
-        `avoid wide spread: ${details.spreadHealthy.status}`
-      );
-    }
-
-    if (
-      details.volatilityAcceptable.score <
-      details.volatilityAcceptable.maxScore
-    ) {
-
-      out.push(
-        `avoid high volatility: ${details.volatilityAcceptable.status}`
-      );
-    }
-
-    if (
-      details.noFailedStreak.score <
-      details.noFailedStreak.maxScore
-    ) {
-
-      out.push(
-        `cooldown failed streak: ${details.noFailedStreak.status}`
-      );
-    }
+    if (details.regimeOK.score < details.regimeOK.maxScore) out.push(`wait for better regime: ${details.regimeOK.status}`);
+    if (details.btcEthAlign.score < details.btcEthAlign.maxScore) out.push(`wait for BTC/ETH alignment: ${details.btcEthAlign.status}`);
+    if (details.volumeConfirm.score < details.volumeConfirm.maxScore) out.push(`wait for stronger volume: ${details.volumeConfirm.status}`);
+    if (details.sweepReclaim.score < details.sweepReclaim.maxScore) out.push(`wait for sweep + reclaim: ${details.sweepReclaim.status}`);
+    if (details.spreadHealthy.score < details.spreadHealthy.maxScore) out.push(`avoid wide spread: ${details.spreadHealthy.status}`);
+    if (details.volatilityAcceptable.score < details.volatilityAcceptable.maxScore) out.push(`avoid high volatility: ${details.volatilityAcceptable.status}`);
+    if (details.noFailedStreak.score < details.noFailedStreak.maxScore) out.push(`cooldown failed streak: ${details.noFailedStreak.status}`);
 
     return out;
   }
