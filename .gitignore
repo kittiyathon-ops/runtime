@@ -32,3 +32,6 @@ coverage/
 node_modules/
 
 *-export.txt
+data/
+*.backup.ts
+project-export*.txt
