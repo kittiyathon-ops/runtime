@@ -27,7 +27,8 @@
     "scan:eth-now": "tsx scripts/eth-adaptive-public-market-scan.ts",
     "watch:eth": "tsx scripts/eth-market-watch.ts",
     "watch:eth-history": "tsx scripts/eth-market-history.ts",
-    "outcome:eth": "tsx scripts/eth-forward-outcome-tracker.ts"
+    "outcome:eth": "tsx scripts/eth-forward-outcome-tracker.ts",
+    "observe:eth": "tsx scripts/eth-runtime-observer.ts"
   },
   "keywords": [],
   "author": "",
