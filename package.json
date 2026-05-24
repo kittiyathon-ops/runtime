@@ -23,7 +23,11 @@
     "probe:eth-adaptive:reject": "tsx scripts/probe-eth-adaptive-rejections.ts",
     "paper:eth-adaptive": "tsx scripts/eth-adaptive-paper-bridge.ts",
     "paper:eth-runtime-probe": "tsx scripts/eth-adaptive-paper-runtime-probe.ts",
-    "live:eth-pretrade": "tsx scripts/eth-adaptive-live-pretrade-gate.ts"
+    "live:eth-pretrade": "tsx scripts/eth-adaptive-live-pretrade-gate.ts",
+    "scan:eth-now": "tsx scripts/eth-adaptive-public-market-scan.ts",
+    "watch:eth": "tsx scripts/eth-market-watch.ts",
+    "watch:eth-history": "tsx scripts/eth-market-history.ts",
+    "outcome:eth": "tsx scripts/eth-forward-outcome-tracker.ts"
   },
   "keywords": [],
   "author": "",
