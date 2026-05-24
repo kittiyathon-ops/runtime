@@ -18,7 +18,10 @@
     "order:mainnet:tiny": "tsx scripts/binance-mainnet-tiny-limit.ts",
     "cancel:mainnet": "tsx scripts/binance-mainnet-cancel.ts",
     "smoke:mainnet:no-order": "tsx scripts/mainnet-no-order-smoke.ts",
-    "replay": "node dist/src/replay/replay-engine.js"
+    "replay": "node dist/src/replay/replay-engine.js",
+    "probe:eth-adaptive": "tsx scripts/probe-eth-adaptive-strategy.ts",
+    "probe:eth-adaptive:reject": "tsx scripts/probe-eth-adaptive-rejections.ts",
+    "paper:eth-adaptive": "tsx scripts/eth-adaptive-paper-bridge.ts"
   },
   "keywords": [],
   "author": "",
@@ -33,14 +36,19 @@
   "type": "module",
   "dependencies": {
     "better-sqlite3": "^12.10.0",
+    "chart.js": "^4.5.1",
+    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "eventemitter3": "^5.0.4",
+    "express": "^5.2.1",
     "pino": "^10.3.1",
     "ws": "^8.20.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^25.8.0",
     "tsx": "^4.22.1",
     "typescript": "^6.0.3"
