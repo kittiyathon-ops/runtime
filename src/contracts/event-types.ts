@@ -9,6 +9,9 @@ export type CanonicalEventType =
   | "ORDER_REJECTED"
   | "EXECUTION_ERROR"
   | "POSITION_UPDATED"
+  | "FEE_CHARGED"
+  | "FUNDING_FEE_APPLIED"
+  | "REALIZED_PNL_UPDATED"
   | "RISK_ALERT"
   | "SAFE_MODE";
 

@@ -33,7 +33,11 @@ export class DivergenceDetector {
     const issues: DivergenceIssue[] = [];
     if (input.primaryPortfolio !== undefined && input.shadowPortfolio !== undefined) {
       if (stable(input.primaryPortfolio) !== stable(input.shadowPortfolio)) {
-        issues.push({ area: "portfolio", severity: "CRITICAL", reason: "portfolio_state_divergence" });
+        issues.push({
+          area: "portfolio",
+          severity: criticalPortfolioDivergence(input.primaryPortfolio, input.shadowPortfolio) ? "CRITICAL" : "WARNING",
+          reason: "portfolio_state_divergence"
+        });
       }
     }
     if (input.primaryGovernance !== undefined && input.shadowGovernance !== undefined && input.primaryGovernance !== input.shadowGovernance) {
@@ -53,6 +57,22 @@ export class DivergenceDetector {
       issues
     };
   }
+}
+
+function criticalPortfolioDivergence(primary: PortfolioSnapshot, shadow: PortfolioSnapshot): boolean {
+  if (primary.cashUsd !== shadow.cashUsd) return true;
+  if (primary.realizedPnlUsd !== shadow.realizedPnlUsd) return true;
+  if (primary.exposureUsd !== shadow.exposureUsd) return true;
+  if (stable(primary.balances) !== stable(shadow.balances)) return true;
+  const symbols = new Set([...Object.keys(primary.positions), ...Object.keys(shadow.positions)]);
+  for (const symbol of symbols) {
+    const primaryPosition = primary.positions[symbol];
+    const shadowPosition = shadow.positions[symbol];
+    if (primaryPosition === undefined || shadowPosition === undefined) return true;
+    if (primaryPosition.quantity !== shadowPosition.quantity) return true;
+    if (primaryPosition.averagePrice !== shadowPosition.averagePrice) return true;
+  }
+  return false;
 }
 
 function stable(value: unknown): string {

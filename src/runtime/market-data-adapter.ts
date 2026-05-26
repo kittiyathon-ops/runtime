@@ -23,3 +23,14 @@ export interface RuntimeMarketDataAdapter {
   stop(): Promise<void> | void;
 }
 
+export function assertAdapterNeutralMarketEvent(event: EventInput): void {
+  if (event.source !== "market_data_adapter") {
+    throw new Error("external_market_event_source_invalid");
+  }
+  if (event.eventType !== "MARKET_TICK" && event.eventType !== "BOOK_UPDATE") {
+    throw new Error("external_market_event_type_invalid");
+  }
+  if ("stream" in event.payload) {
+    throw new Error("external_market_event_payload_not_adapter_neutral");
+  }
+}

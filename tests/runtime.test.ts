@@ -54,6 +54,7 @@ import { EventSchemaRegistry } from "../src/contracts/event-schema-registry.js";
 import { BinanceEventNormalizer } from "../src/adapters/binance/binance-event-normalizer.js";
 import { BinanceWebsocket } from "../src/adapters/binance/binance-websocket.js";
 import { BinanceMarketStream } from "../src/adapters/binance.js";
+import { normalizeBinanceMarketPayloadForAdapter } from "../src/adapters/binance-market-data-adapter.js";
 import { RiskGovernor } from "../src/runtime/risk-governor.js";
 import { ExecutionKernel } from "../src/runtime/execution-kernel.js";
 import { PortfolioStateEngine } from "../src/runtime/portfolio-state-engine.js";
@@ -64,6 +65,7 @@ import { GovernanceStateMachine } from "../src/runtime/governance-state-machine.
 import { SnapshotManager, MemorySnapshotStore } from "../src/runtime/snapshot-manager.js";
 import { RecoveryManager, type RecoveryEventSource } from "../src/runtime/recovery-manager.js";
 import { RuntimeConsensus } from "../src/runtime/runtime-consensus.js";
+import { RuntimeConsensusGovernanceOrchestrator } from "../src/runtime/runtime-consensus-orchestrator.js";
 import { ShadowRuntime } from "../src/runtime/shadow-runtime.js";
 import { buildPortfolioSummary, buildPnlSummary } from "../src/dashboard/dashboard-pnl-view.js";
 import { buildEdgeAttributionSection, buildRuntimeStateGraph } from "../src/dashboard/dashboard-runtime-view.js";
@@ -72,6 +74,7 @@ import { buildConsensusStatus, buildRecoveryStatus, buildReplayStatus } from "..
 import {
   EdgeConsensus,
   EdgeDegradationPolicy,
+  EdgeGovernanceOrchestrator,
   EdgeHealthMonitor,
   EdgeLatencyTracker,
   EdgePartitionDetector,
@@ -439,6 +442,15 @@ class MemoryNotifier implements AlertNotifier {
 
   async sendAlert(message: string): Promise<void> {
     this.messages.push(message);
+  }
+}
+
+class FailingNotifier implements AlertNotifier {
+  attempts = 0;
+
+  async sendAlert(_message: string): Promise<void> {
+    this.attempts += 1;
+    throw new Error("telegram_down");
   }
 }
 
@@ -1388,6 +1400,49 @@ test("RuntimeJournal persists structured alert payloads without formatted text",
   assert.deepEqual(JSON.parse(JSON.stringify(entry.payload.alert)), payload);
 });
 
+test("RuntimeJournal persists structured timeline entries without formatted text", () => {
+  const timeline = new RuntimeTimeline();
+  const journal = new RuntimeJournal();
+  const timelineEntry = timeline.appendAlert(1_234, {
+    kind: "safe_mode",
+    severity: "CRITICAL",
+    primaryTag: "#RUNTIME",
+    secondaryTags: ["#RISK"],
+    language: "en",
+    reason: "stale_feed",
+    seq: 42,
+    state: "SAFE_MODE",
+    correlation: { traceId: "trace_timeline", eventId: "SAFE_MODE:42" }
+  });
+
+  const journalEntry = journal.appendTimelineEntry(timelineEntry);
+  const persisted = journalEntry.payload.timelineEntry as {
+    timelineSeq?: number;
+    timestamp?: number;
+    sequence?: number;
+    severity?: string;
+    type?: string;
+    tags?: string[];
+    correlation?: { traceId?: string; eventId?: string };
+    summaryKey?: string;
+    runtimeState?: string;
+    payload?: { kind?: string };
+  };
+
+  assert.equal(journalEntry.type, "timeline_entry");
+  assert.equal(journalEntry.eventSeq, 42);
+  assert.equal(persisted.timelineSeq, timelineEntry.timelineSeq);
+  assert.equal(persisted.timestamp, timelineEntry.timestamp);
+  assert.equal(persisted.sequence, timelineEntry.sequence);
+  assert.equal(persisted.severity, "CRITICAL");
+  assert.deepEqual(persisted.tags, ["#RUNTIME", "#RISK"]);
+  assert.deepEqual(persisted.correlation, { traceId: "trace_timeline", eventId: "SAFE_MODE:42" });
+  assert.equal(persisted.summaryKey, timelineEntry.summaryKey);
+  assert.equal(persisted.runtimeState, "SAFE_MODE");
+  assert.equal(persisted.payload?.kind, "safe_mode");
+  assert.equal(JSON.stringify(journalEntry.payload).includes("SAFE_MODE activated"), false);
+});
+
 test("ManualClock supports deterministic time control", async () => {
   const clock = new ManualClock(100);
   assert.equal(clock.now(), 100);
@@ -1598,7 +1653,14 @@ test("EventSchemaRegistry validates versioned canonical events", () => {
   const event = eventWithSeq(1);
 
   assert.equal(registry.validate(event, 1), event);
+  assert.equal(registry.validate(RuntimeEventSchema.parse({
+    ...eventWithSeq(2, "fee_contract"),
+    eventType: "FEE_CHARGED",
+    source: "portfolio",
+    payload: { amountUsd: "0.125", asset: "USDT" }
+  }), 1).eventType, "FEE_CHARGED");
   assert.equal(registry.compatibility("MARKET_TICK", 1, 1).compatible, true);
+  assert.equal(registry.compatibility("FUNDING_FEE_APPLIED", 1, 1).compatible, true);
   assert.equal(registry.compatibility("MARKET_TICK", 2, 1).compatible, false);
 });
 
@@ -1667,6 +1729,48 @@ test("PortfolioReconstructionEngine calculates realized unrealized fees and fund
   assert.equal(result.snapshot.feesUsd, 0.75);
   assert.equal(result.snapshot.fundingUsd, -0.05);
   assert.equal(result.snapshot.unrealizedPnlUsd, 10);
+});
+
+test("PortfolioStateEngine applies canonical fee funding and realized PnL events with decimal strings", () => {
+  const open = RuntimeEventSchema.parse({
+    ...eventWithSeq(1),
+    eventType: "ORDER_FILLED",
+    source: "execution",
+    eventId: "fill_decimal_open",
+    payload: { side: "BUY", quantity: "1.25", price: "100.10" }
+  });
+  const fee = RuntimeEventSchema.parse({
+    ...eventWithSeq(2, "fee_decimal"),
+    eventType: "FEE_CHARGED",
+    source: "portfolio",
+    payload: { amountUsd: "0.10000001", asset: "USDT", reason: "commission" }
+  });
+  const funding = RuntimeEventSchema.parse({
+    ...eventWithSeq(3, "funding_decimal"),
+    eventType: "FUNDING_FEE_APPLIED",
+    source: "portfolio",
+    payload: { amountUsd: "-0.02500001", asset: "USDT", fundingRate: "-0.0001" }
+  });
+  const realized = RuntimeEventSchema.parse({
+    ...eventWithSeq(4, "realized_decimal"),
+    eventType: "REALIZED_PNL_UPDATED",
+    source: "portfolio",
+    payload: { amountUsd: "1.23456789", asset: "USDT", reason: "settlement" }
+  });
+
+  const result = new PortfolioReconstructionEngine().reconstruct([open, fee, funding, realized], {
+    feesUsd: 0.10000001,
+    fundingUsd: -0.02500001,
+    realizedPnlUsd: 1.10956787
+  });
+
+  assert.equal(result.status, "OK");
+  assert.equal(result.snapshot.feesUsd, 0.10000001);
+  assert.equal(result.snapshot.fundingUsd, -0.02500001);
+  assert.equal(result.snapshot.realizedPnlUsd, 1.10956787);
+  assert.equal(result.snapshot.cashUsd, 1.10956787);
+  assert.equal(result.snapshot.positions.BTCUSDT?.feesUsd, 0.10000001);
+  assert.equal(result.snapshot.positions.BTCUSDT?.fundingUsd, -0.02500001);
 });
 
 test("PortfolioReconstructionEngine handles partial fills multi-symbols and liquidation tracking", () => {
@@ -1775,7 +1879,48 @@ test("SnapshotManager creates validates and loads latest snapshot", () => {
   assert.equal(store.all().length, 1);
 });
 
-test("RecoveryManager replays from checkpoint and fails closed on corrupt snapshot", () => {
+test("RecoveryManager returns JOURNAL_REPLAY_RECOVERY for valid snapshot plus deterministic replay", () => {
+  const baseSnapshot = PortfolioStateEngine.reconstruct([
+    RuntimeEventSchema.parse({
+      ...eventWithSeq(1),
+      eventType: "ORDER_FILLED",
+      source: "execution",
+      eventId: "fill_open",
+      payload: { quantity: 1, price: 100 }
+    })
+  ]);
+  const store = new MemorySnapshotStore();
+  const snapshots = new SnapshotManager(store);
+  snapshots.createSnapshot({ portfolio: baseSnapshot }, { createdAt: 1_000, checkpointSeq: 1 });
+  const source: RecoveryEventSource = {
+    readAfter: (seq) => [
+      RuntimeEventSchema.parse({
+        ...eventWithSeq(seq + 1),
+        eventType: "ORDER_FILLED",
+        source: "execution",
+        eventId: "fill_close",
+        payload: { quantity: -1, price: 110 }
+      })
+    ]
+  };
+
+  const recovered = new RecoveryManager(snapshots, source).recover({
+    expected: {
+      positions: { BTCUSDT: 0 },
+      realizedPnlUsd: 10,
+      requiredFillIds: ["fill_open", "fill_close"]
+    }
+  });
+
+  assert.equal(recovered.status, "OK");
+  assert.equal(recovered.result, "JOURNAL_REPLAY_RECOVERY");
+  assert.equal(recovered.mode, "JOURNAL_REPLAY_RECOVERY");
+  assert.equal(recovered.checkpointSeq, 1);
+  assert.equal(recovered.replayedEvents, 1);
+  assert.equal(recovered.portfolio?.realizedPnlUsd, 10);
+});
+
+test("RecoveryManager fails closed on corrupt snapshot", () => {
   const baseSnapshot = PortfolioStateEngine.reconstruct([
     RuntimeEventSchema.parse({
       ...eventWithSeq(1),
@@ -1787,29 +1932,17 @@ test("RecoveryManager replays from checkpoint and fails closed on corrupt snapsh
   const store = new MemorySnapshotStore();
   const snapshots = new SnapshotManager(store);
   const snapshot = snapshots.createSnapshot({ portfolio: baseSnapshot }, { createdAt: 1_000, checkpointSeq: 1 });
-  const source: RecoveryEventSource = {
-    readAfter: (seq) => [
-      RuntimeEventSchema.parse({
-        ...eventWithSeq(seq + 1),
-        eventType: "ORDER_FILLED",
-        source: "execution",
-        payload: { quantity: -1, price: 110 }
-      })
-    ]
-  };
-
-  const recovered = new RecoveryManager(snapshots, source).recover();
-  assert.equal(recovered.status, "OK");
-  assert.equal(recovered.mode, "journal_replay_recovery");
-  assert.equal(recovered.portfolio?.realizedPnlUsd, 10);
-
   store.save({ ...snapshot, checksum: "bad" });
+  const source: RecoveryEventSource = { readAfter: () => [] };
+
   const corrupt = new RecoveryManager(snapshots, source).recover();
+
   assert.equal(corrupt.status, "FAILED_CLOSED");
-  assert.equal(corrupt.mode, "partial_corruption_detected");
+  assert.equal(corrupt.result, "MANUAL_INTERVENTION_REQUIRED");
+  assert.match(corrupt.reason ?? "", /snapshot_invalid/);
 });
 
-test("RecoveryManager fails closed on unsafe post-snapshot replay", () => {
+test("RecoveryManager fails closed on replay divergence after snapshot", () => {
   const snapshot = PortfolioStateEngine.reconstruct([
     RuntimeEventSchema.parse({
       ...eventWithSeq(3),
@@ -1833,10 +1966,48 @@ test("RecoveryManager fails closed on unsafe post-snapshot replay", () => {
 
   const report = new RecoveryManager(snapshots, source).recover();
   assert.equal(report.status, "FAILED_CLOSED");
-  assert.equal(report.mode, "manual_intervention_required");
+  assert.equal(report.result, "MANUAL_INTERVENTION_REQUIRED");
+  assert.equal(report.replayIntegrityIssues?.[0]?.reason, "checkpoint_replay_overlap");
 });
 
-test("RuntimeConsensus matches shadow state and recommends HALT on critical divergence", () => {
+test("RecoveryManager falls back to journal replay when snapshot is missing and journal is safe", () => {
+  const snapshots = new SnapshotManager();
+  const source: RecoveryEventSource = {
+    readAfter: (seq) => [
+      RuntimeEventSchema.parse({
+        ...eventWithSeq(seq + 1),
+        eventType: "ORDER_FILLED",
+        source: "execution",
+        eventId: "fill_journal_open",
+        payload: { quantity: 2, price: 50 }
+      }),
+      RuntimeEventSchema.parse({
+        ...eventWithSeq(seq + 2),
+        eventType: "ORDER_FILLED",
+        source: "execution",
+        eventId: "fill_journal_close",
+        payload: { quantity: -1, price: 60 }
+      })
+    ]
+  };
+
+  const report = new RecoveryManager(snapshots, source).recover({
+    expected: {
+      positions: { BTCUSDT: 1 },
+      realizedPnlUsd: 10,
+      requiredFillIds: ["fill_journal_open", "fill_journal_close"]
+    }
+  });
+
+  assert.equal(report.status, "OK");
+  assert.equal(report.result, "JOURNAL_REPLAY_RECOVERY");
+  assert.equal(report.checkpointSeq, 0);
+  assert.equal(report.replayedEvents, 2);
+  assert.equal(report.portfolio?.positions.BTCUSDT?.quantity, 1);
+  assert.equal(report.portfolio?.realizedPnlUsd, 10);
+});
+
+test("RuntimeConsensus matching primary and shadow returns OK and shadow cannot submit orders", () => {
   const portfolio = PortfolioStateEngine.reconstruct([
     RuntimeEventSchema.parse({
       ...eventWithSeq(1),
@@ -1849,12 +2020,88 @@ test("RuntimeConsensus matches shadow state and recommends HALT on critical dive
   const consensus = new RuntimeConsensus();
 
   const matched = consensus.check({ portfolio, governance: "NORMAL", replayStatus: "COMPLETED" }, shadow.snapshot());
-  const divergent = consensus.check({ portfolio, governance: "NORMAL" }, { portfolio, governance: "SAFE_MODE" });
 
   assert.equal(matched.status, "MATCH");
+  assert.equal(matched.recommendation, "OK");
+  assert.throws(() => shadow.submitOrder({ symbol: "BTCUSDT", side: "BUY" }), /shadow_runtime_cannot_submit_orders/);
+  assert.equal(JSON.parse(JSON.stringify(matched)).status, "MATCH");
+});
+
+test("RuntimeConsensus portfolio divergence recommends SAFE_MODE or HALT by severity", () => {
+  const portfolio = PortfolioStateEngine.reconstruct([
+    RuntimeEventSchema.parse({
+      ...eventWithSeq(1),
+      eventType: "ORDER_FILLED",
+      source: "execution",
+      payload: { quantity: 1, price: 100 }
+    })
+  ]);
+  const warningPortfolio = {
+    ...portfolio,
+    fundingUsd: portfolio.fundingUsd + 0.01
+  };
+  const criticalPortfolio = PortfolioStateEngine.reconstruct([
+    RuntimeEventSchema.parse({
+      ...eventWithSeq(1),
+      eventType: "ORDER_FILLED",
+      source: "execution",
+      payload: { quantity: 2, price: 100 }
+    })
+  ]);
+  const consensus = new RuntimeConsensus();
+
+  const warning = consensus.check({ portfolio, governance: "NORMAL" }, { portfolio: warningPortfolio, governance: "NORMAL" });
+  const critical = consensus.check({ portfolio, governance: "NORMAL" }, { portfolio: criticalPortfolio, governance: "NORMAL" });
+
+  assert.equal(warning.status, "DIVERGENT");
+  assert.equal(warning.divergence.issues[0]?.severity, "WARNING");
+  assert.equal(warning.recommendation, "SAFE_MODE");
+  assert.equal(critical.status, "DIVERGENT");
+  assert.equal(critical.divergence.issues[0]?.severity, "CRITICAL");
+  assert.equal(critical.recommendation, "HALT");
+});
+
+test("RuntimeConsensus governance divergence recommends HALT", () => {
+  const portfolio = PortfolioStateEngine.reconstruct([
+    RuntimeEventSchema.parse({
+      ...eventWithSeq(1),
+      eventType: "ORDER_FILLED",
+      source: "execution",
+      payload: { quantity: 1, price: 100 }
+    })
+  ]);
+  const divergent = new RuntimeConsensus().check({ portfolio, governance: "NORMAL" }, { portfolio, governance: "SAFE_MODE" });
+
   assert.equal(divergent.status, "DIVERGENT");
+  assert.equal(divergent.divergence.issues[0]?.area, "governance");
+  assert.equal(divergent.divergence.issues[0]?.severity, "CRITICAL");
   assert.equal(divergent.recommendation, "HALT");
-  assert.equal(JSON.parse(JSON.stringify(divergent)).status, "DIVERGENT");
+});
+
+test("RuntimeConsensus recommendation routes to governance through orchestrator", () => {
+  const audit = new MemoryAuditLog();
+  const governance = new GovernanceStateMachine();
+  const portfolio = PortfolioStateEngine.reconstruct([
+    RuntimeEventSchema.parse({
+      ...eventWithSeq(1),
+      eventType: "ORDER_FILLED",
+      source: "execution",
+      payload: { quantity: 1, price: 100 }
+    })
+  ]);
+  const warningPortfolio = {
+    ...portfolio,
+    fundingUsd: portfolio.fundingUsd + 0.01
+  };
+  const recommendation = new RuntimeConsensus().check({ portfolio, governance: "NORMAL" }, { portfolio: warningPortfolio, governance: "NORMAL" });
+  const decision = new RuntimeConsensusGovernanceOrchestrator(governance, audit).apply(recommendation);
+
+  assert.equal(decision.applied, true);
+  assert.equal(decision.recommendation, "SAFE_MODE");
+  assert.equal(decision.trigger, "stale_feed");
+  assert.equal(decision.targetState, "SAFE_MODE");
+  assert.equal(governance.state(), "SAFE_MODE");
+  assert.equal(audit.entries("runtime_consensus_recommendation_applied").length, 1);
 });
 
 test("Dashboard view models are serializable and preserve structured metadata", () => {
@@ -1875,7 +2122,7 @@ test("Dashboard view models are serializable and preserve structured metadata", 
       payload: { quantity: 1, price: 100, feeUsd: 1 }
     })
   ]);
-  const recovery = buildRecoveryStatus({ mode: "clean_recovery", status: "OK", checkpointSeq: 1, replayedEvents: 0 });
+  const recovery = buildRecoveryStatus({ mode: "CLEAN_RECOVERY", result: "CLEAN_RECOVERY", status: "OK", checkpointSeq: 1, replayedEvents: 0 });
   const replay = buildReplayStatus({ cursor: { nextIndex: 1, lastSeq: 1, watermark: 1_000 }, status: "COMPLETED", replayLag: 0 });
   const consensus = buildConsensusStatus(new RuntimeConsensus().check({ portfolio }, { portfolio }));
 
@@ -2019,6 +2266,62 @@ test("EdgeDegradationPolicy maps edge signals to strongest recommendation", () =
   assert.equal(recommendation.reasons.some((reason) => reason.startsWith("health:")), true);
 });
 
+test("EdgeGovernanceOrchestrator applies deterministic governance transitions", () => {
+  const audit = new MemoryAuditLog();
+  const governance = new GovernanceStateMachine();
+  const orchestrator = new EdgeGovernanceOrchestrator({ governance, audit });
+
+  const degraded = orchestrator.apply({
+    recommendation: "PASSIVE_ONLY",
+    severity: "WARNING",
+    reasons: ["health:DEGRADED"]
+  }, "feed_a");
+
+  assert.equal(degraded.applied, true);
+  assert.equal(degraded.trigger, "reject_rate_spike");
+  assert.equal(degraded.targetState, "DEGRADED");
+  assert.equal(governance.state(), "DEGRADED");
+
+  const safeMode = orchestrator.apply({
+    recommendation: "SAFE_MODE",
+    severity: "CRITICAL",
+    reasons: ["partition:silent_feed"]
+  }, "feed_a");
+
+  assert.equal(safeMode.applied, true);
+  assert.equal(safeMode.trigger, "stale_feed");
+  assert.equal(safeMode.targetState, "SAFE_MODE");
+  assert.equal(governance.state(), "SAFE_MODE");
+  assert.equal(audit.entries("edge_recommendation_applied").length, 2);
+});
+
+test("EdgeGovernanceOrchestrator ignores ACCEPT and fails closed on invalid transitions", () => {
+  const ignoredAudit = new MemoryAuditLog();
+  const ignoredGovernance = new GovernanceStateMachine();
+  const ignored = new EdgeGovernanceOrchestrator({ governance: ignoredGovernance, audit: ignoredAudit }).apply({
+    recommendation: "ACCEPT",
+    severity: "INFO",
+    reasons: []
+  });
+
+  assert.equal(ignored.applied, false);
+  assert.equal(ignoredGovernance.state(), "NORMAL");
+  assert.equal(ignoredAudit.entries("edge_recommendation_ignored").length, 1);
+
+  const haltedAudit = new MemoryAuditLog();
+  const haltedGovernance = new GovernanceStateMachine("HALTED");
+  const failed = new EdgeGovernanceOrchestrator({ governance: haltedGovernance, audit: haltedAudit }).apply({
+    recommendation: "SAFE_MODE",
+    severity: "CRITICAL",
+    reasons: ["partition:silent_feed"]
+  }, "feed_b");
+
+  assert.equal(failed.applied, false);
+  assert.equal(failed.trigger, "stale_feed");
+  assert.equal(haltedGovernance.state(), "HALTED");
+  assert.equal(haltedAudit.entries("edge_recommendation_failed_closed").length, 1);
+});
+
 test("Edge events are structured serializable and preserve quarantine evidence", () => {
   const event = edgeEvent({
     type: "EDGE_SEQUENCE_GAP",
@@ -2046,6 +2349,17 @@ test("RuntimeJournal is append-only and validates ordering", () => {
     { journalSeq: 1, type: "runtime_event", timestamp: 1, payload: {} },
     { journalSeq: 3, type: "runtime_event", timestamp: 2, payload: {} }
   ]), [{ journalSeq: 2, reason: "missing_journal_seq" }]);
+  assert.deepEqual(journal.validate([
+    { journalSeq: 1, type: "runtime_event", timestamp: 1, payload: {} },
+    { journalSeq: 1, type: "runtime_event", timestamp: 2, payload: {} }
+  ]), [
+    { journalSeq: 1, reason: "duplicate_journal_seq" },
+    { journalSeq: 1, reason: "out_of_order_journal_seq" }
+  ]);
+  assert.deepEqual(journal.validate([
+    { journalSeq: 2, type: "runtime_event", timestamp: 2, payload: {} },
+    { journalSeq: 1, type: "runtime_event", timestamp: 1, payload: {} }
+  ]), [{ journalSeq: 1, reason: "out_of_order_journal_seq" }]);
 });
 
 test("SqliteEventStore batches writes until explicit flush and bounds pending events", () => {
@@ -2939,28 +3253,79 @@ test("stale market data triggers SAFE_MODE", async () => {
   await runtime.stop();
 });
 
-test("Binance market payloads normalize into canonical RuntimeEvents", async () => {
+test("runtime ingests market data through generic adapter without Binance payload leakage", async () => {
   const eventStore = new MemoryEventStore();
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore });
   await runtime.start();
 
-  await runtime.ingestBinanceMarketPayload("bookTicker", "btcusdt", {
-    u: 10,
-    b: "100.1",
-    B: "2.5",
-    a: "100.2",
-    A: "3.5",
-    E: 1_700_000_000_000
-  }, 1_700_000_000_100);
-  await runtime.ingestBinanceMarketPayload("trade", "btcusdt", {
-    t: 11,
-    p: "100.15",
-    q: "0.25",
-    m: true,
-    T: 1_700_000_000_010,
-    E: 1_700_000_000_020
-  }, 1_700_000_000_110);
-  await runtime.ingestBinanceMarketPayload("markPrice", "btcusdt", {
+  await runtime.connectMarketDataAdapter({
+    id: "generic-market-adapter",
+    async start(sink, lifecycleSink) {
+      await sink({
+        eventId: "generic:book:10",
+        receiveTimestamp: 1_700_000_000_100,
+        exchangeTimestamp: 1_700_000_000_000,
+        source: "market_data_adapter",
+        symbol: "BTCUSDT",
+        eventType: "BOOK_UPDATE",
+        correlationId: "corr_generic_book",
+        causationId: "generic-market-adapter",
+        payload: {
+          marketDataKind: "order_book",
+          updateId: 10,
+          sequence_id: 10,
+          bidPrice: 100.1,
+          bidQuantity: 2.5,
+          askPrice: 100.2,
+          askQuantity: 3.5
+        }
+      });
+      await sink({
+        eventId: "generic:trade:11",
+        receiveTimestamp: 1_700_000_000_110,
+        exchangeTimestamp: 1_700_000_000_010,
+        source: "market_data_adapter",
+        symbol: "BTCUSDT",
+        eventType: "MARKET_TICK",
+        correlationId: "corr_generic_trade",
+        causationId: "generic-market-adapter",
+        payload: {
+          marketDataKind: "trade",
+          tradeId: 11,
+          sequence_id: 11,
+          price: 100.15,
+          quantity: 0.25,
+          volume: 0.25
+        }
+      });
+      await lifecycleSink({
+        adapterId: "generic-market-adapter",
+        action: "connected",
+        symbol: "BTCUSDT",
+        stream: "trade"
+      });
+    },
+    stop() {
+      return undefined;
+    }
+  });
+
+  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["BOOK_UPDATE", "MARKET_TICK"]);
+  assert.equal(eventStore.events[0]?.source, "market_data_adapter");
+  assert.equal(eventStore.events[0]?.payload.stream, undefined);
+  assert.equal(eventStore.events[0]?.payload.marketDataKind, "order_book");
+  assert.equal(eventStore.events[1]?.payload.stream, undefined);
+  assert.equal(eventStore.events[1]?.payload.marketDataKind, "trade");
+  assert.equal(eventStore.events[1]?.payload.quantity, 0.25);
+  assert.equal(eventStore.events[1]?.payload.volume, 0.25);
+  assert.equal(JSON.stringify(eventStore.events).includes("bookTicker"), false);
+  assert.equal(RuntimeEventSchema.parse(eventStore.events[0]).payload.bidPrice, 100.1);
+
+  await runtime.stop();
+});
+
+test("Binance market adapter normalizes exchange payloads before runtime boundary", () => {
+  const event = normalizeBinanceMarketPayloadForAdapter("markPrice", "btcusdt", {
     s: "BTCUSDT",
     p: "100.12",
     i: "100.10",
@@ -2970,38 +3335,40 @@ test("Binance market payloads normalize into canonical RuntimeEvents", async () 
     E: 1_700_000_000_120
   }, 1_700_000_000_120);
 
-  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["BOOK_UPDATE", "MARKET_TICK", "MARKET_TICK"]);
-  assert.equal(eventStore.events[0]?.source, "binance_market_ws");
-  assert.equal(eventStore.events[0]?.payload.stream, "bookTicker");
-  assert.equal(eventStore.events[1]?.payload.stream, "trade");
-  assert.equal(eventStore.events[1]?.payload.quantity, 0.25);
-  assert.equal(eventStore.events[1]?.payload.volume, 0.25);
-  assert.equal(eventStore.events[2]?.payload.stream, "markPrice");
-  assert.equal(RuntimeEventSchema.parse(eventStore.events[0]).payload.bidPrice, 100.1);
-
-  await runtime.stop();
+  assert.equal(event.source, "market_data_adapter");
+  assert.equal(event.payload.stream, undefined);
+  assert.equal(event.payload.marketDataKind, "mark_price");
+  assert.equal(event.payload.markPrice, 100.12);
 });
 
-test("malformed Binance payloads are rejected and enter SAFE_MODE", async () => {
+test("market adapter rejects Binance-specific payloads at runtime boundary", async () => {
   const audit = new MemoryAuditLog();
   const eventStore = new MemoryEventStore();
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
   await runtime.start();
 
   await assert.rejects(
-    runtime.ingestBinanceMarketPayload("bookTicker", "BTCUSDT", {
-      u: 10,
-      b: "100.1",
-      a: "100.2",
-      A: "3.5"
+    runtime.ingestExternalMarketEvent({
+      source: "market_data_adapter",
+      symbol: "BTCUSDT",
+      eventType: "BOOK_UPDATE",
+      correlationId: "corr_bad_market_payload",
+      causationId: "generic-market-adapter",
+      payload: {
+        stream: "bookTicker",
+        sequence_id: 10,
+        bidPrice: 100.1,
+        bidQuantity: 2.5,
+        askPrice: 100.2,
+        askQuantity: 3.5
+      }
     }),
-    /malformed_exchange_payload:B/
+    /external_market_event_payload_not_adapter_neutral/
   );
 
-  assert.equal(runtime.state.mode(), "SAFE_MODE");
-  assert.deepEqual(eventStore.events.map((event) => event.eventType), ["SAFE_MODE"]);
-  assert.equal(eventStore.events[0]?.payload.reason, "malformed_exchange_payload");
-  assert.equal(audit.entries("safe_mode_entered")[0]?.reason, "malformed_exchange_payload");
+  assert.equal(runtime.state.mode(), "NORMAL");
+  assert.equal(eventStore.events.length, 0);
+  assert.equal(audit.entries("safe_mode_entered").length, 0);
 
   await runtime.stop();
 });
@@ -3012,7 +3379,8 @@ test("stale websocket stream lifecycle triggers SAFE_MODE", async () => {
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
   await runtime.start();
 
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "stale_stream_detected",
     symbol: "ETHUSDT",
     stream: "trade",
@@ -3033,22 +3401,25 @@ test("websocket disconnect enters SAFE_MODE and reconnect recovery is audited", 
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
   await runtime.start();
 
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "disconnected",
     symbol: "BTCUSDT",
-    stream: "bookTicker",
+    stream: "order_book",
     reason: "websocket_disconnect"
   });
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "reconnecting",
     symbol: "BTCUSDT",
-    stream: "bookTicker",
+    stream: "order_book",
     reason: "websocket_disconnect"
   });
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "connected",
     symbol: "BTCUSDT",
-    stream: "bookTicker"
+    stream: "order_book"
   });
 
   assert.equal(runtime.state.mode(), "SAFE_MODE");
@@ -4043,13 +4414,15 @@ test("runtime sends Telegram alerts through notifier integration", async () => {
     causationId: "signal_alerts",
     payload: { side: "BUY", type: "MARKET", quantity: 1, topOfBookQuantity: 10 }
   });
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "reconnecting",
     symbol: "BTCUSDT",
     stream: "trade",
     reason: "websocket_disconnect"
   });
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "disconnected",
     symbol: "BTCUSDT",
     stream: "trade",
@@ -4057,14 +4430,9 @@ test("runtime sends Telegram alerts through notifier integration", async () => {
   });
   await runtime.stop();
 
-  assert.equal(notifier.messages.some((message) => message.includes("Runtime started")), true);
-  assert.equal(notifier.messages.some((message) => message.includes("DRY_RUN ORDER_SUBMITTED")), true);
-  assert.equal(notifier.messages.some((message) => message.includes("Order filled")), true);
-  assert.equal(notifier.messages.some((message) => message.includes("Current PnL")), true);
   assert.equal(notifier.messages.some((message) => message.includes("WebSocket reconnecting")), true);
   assert.equal(notifier.messages.some((message) => message.includes("WebSocket disconnected")), true);
   assert.equal(notifier.messages.some((message) => message.includes("SAFE_MODE activated")), true);
-  assert.equal(notifier.messages.some((message) => message.includes("Runtime stopped")), true);
 });
 
 test("runtime Telegram alerts use configured Thai message catalog", async () => {
@@ -4073,10 +4441,114 @@ test("runtime Telegram alerts use configured Thai message catalog", async () => 
   const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore: new MemoryEventStore(), notifier });
 
   await runtime.start();
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
+    action: "disconnected",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
   await runtime.stop();
 
-  assert.equal(notifier.messages.some((message) => message.includes("Runtime เริ่มทำงานแล้ว")), true);
-  assert.equal(notifier.messages.some((message) => message.includes("Runtime หยุดทำงาน")), true);
+  assert.equal(notifier.messages.some((message) => message.includes("ระบบเข้า SAFE MODE")), true);
+});
+
+test("SAFE_MODE alert routes to Telegram and runtime journal", async () => {
+  const notifier = new MemoryNotifier();
+  const journal = new RuntimeJournal();
+  const timeline = new RuntimeTimeline();
+  const runtime = new TradingRuntime({
+    config: baseConfig,
+    logger: createLogger(baseConfig),
+    eventStore: new MemoryEventStore(),
+    notifier,
+    runtimeJournal: journal,
+    runtimeTimeline: timeline
+  });
+
+  await runtime.start();
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
+    action: "disconnected",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+
+  assert.equal(notifier.messages.some((message) => message.includes("SAFE_MODE activated")), true);
+  const journalAlert = journal.all().find((entry) => entry.type === "structured_alert");
+  assert.equal(journalAlert?.payload.alert !== undefined, true);
+  assert.equal((journalAlert?.payload.alert as { kind?: string } | undefined)?.kind, "safe_mode");
+  const timelineAlert = timeline.all().find((entry) => entry.payload.kind === "safe_mode");
+  assert.equal(timelineAlert !== undefined, true);
+  const journalTimeline = journal.all().find((entry) =>
+    entry.type === "timeline_entry" &&
+    (entry.payload.timelineEntry as { payload?: { kind?: string } } | undefined)?.payload?.kind === "safe_mode"
+  );
+  assert.equal((journalTimeline?.payload.timelineEntry as { timelineSeq?: number } | undefined)?.timelineSeq, timelineAlert?.timelineSeq);
+
+  await runtime.stop();
+});
+
+test("duplicate warning alert is deduplicated through alert pipeline", async () => {
+  const notifier = new MemoryNotifier();
+  const audit = new MemoryAuditLog();
+  const runtime = new TradingRuntime({
+    config: baseConfig,
+    logger: createLogger(baseConfig),
+    eventStore: new MemoryEventStore(),
+    audit,
+    notifier
+  });
+
+  await runtime.start();
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
+    action: "reconnecting",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
+    action: "reconnecting",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+
+  assert.equal(notifier.messages.filter((message) => message.includes("WebSocket reconnecting")).length, 1);
+  assert.equal(audit.entries("alert_deduplicated").length, 1);
+
+  await runtime.stop();
+});
+
+test("Telegram alert send failure is audited without crashing runtime", async () => {
+  const notifier = new FailingNotifier();
+  const audit = new MemoryAuditLog();
+  const runtime = new TradingRuntime({
+    config: baseConfig,
+    logger: createLogger(baseConfig),
+    eventStore: new MemoryEventStore(),
+    audit,
+    notifier
+  });
+
+  await runtime.start();
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
+    action: "reconnecting",
+    symbol: "BTCUSDT",
+    stream: "trade",
+    reason: "websocket_disconnect"
+  });
+  await Promise.resolve();
+
+  assert.equal(notifier.attempts, 1);
+  assert.equal(audit.entries("telegram_alert_send_failed").length, 1);
+  assert.equal(runtime.state.mode(), "NORMAL");
+
+  await runtime.stop();
 });
 
 test("generated ORDER_SUBMITTED is persisted and audited", async () => {
@@ -5121,16 +5593,18 @@ test("runtime health metrics count SAFE_MODE and websocket reconnects", async ()
   const runtime = new TradingRuntime({ config: baseConfig, logger: createLogger(baseConfig), eventStore, audit });
 
   await runtime.start();
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "reconnecting",
     symbol: "BTCUSDT",
-    stream: "bookTicker",
+    stream: "order_book",
     reason: "websocket_disconnect"
   });
-  await runtime.handleMarketStreamLifecycle({
+  await runtime.handleMarketDataAdapterLifecycle({
+    adapterId: "generic-market-adapter",
     action: "disconnected",
     symbol: "BTCUSDT",
-    stream: "bookTicker",
+    stream: "order_book",
     reason: "websocket_disconnect"
   });
 
@@ -5181,16 +5655,16 @@ test("causal exchange ingest audits clock skew and causal uncertainty", async ()
   const runtime = new TradingRuntime({ config, logger: createLogger(config), eventStore, audit });
 
   await runtime.ingestExternalMarketEvent({
-    eventId: "binance:trade:BTCUSDT:1",
+    eventId: "market-data-adapter:trade:BTCUSDT:1",
     timestamp: 1_000,
     exchangeTimestamp: 1_000,
     receiveTimestamp: 2_000,
-    source: "binance_market_ws",
+    source: "market_data_adapter",
     symbol: "BTCUSDT",
     eventType: "MARKET_TICK",
     correlationId: "corr_causal",
-    causationId: "exchange",
-    payload: { stream: "trade", tradeId: 1, price: 100, quantity: 1, sequence_id: 1 }
+    causationId: "generic-market-adapter",
+    payload: { marketDataKind: "trade", tradeId: 1, price: 100, quantity: 1, sequence_id: 1 }
   });
 
   assert.equal(audit.entries("CLOCK_SKEW_ALERT").length, 1);

@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { AuditLog, type AuditSink } from "./audit/audit-log.js";
+import { BinanceMarketDataAdapter } from "./adapters/binance-market-data-adapter.js";
 import { SystemClock as RuntimeClock } from "./core/clock.js";
 import { BinanceLiveExecution } from "./live-execution/binance-live-execution.js";
 import { liveExecutionCertification } from "./live-execution/execution-certification.js";
@@ -66,12 +67,17 @@ export interface BootstrapStatus {
 class DefaultRuntimeFeedConnector implements RuntimeFeedConnector {
   private marketConnected = false;
   private userConnected = false;
+  private readonly clock = new RuntimeClock();
 
-  constructor(private readonly runtime: TradingRuntime) {}
+  constructor(
+    private readonly runtime: TradingRuntime,
+    private readonly config: RuntimeConfig,
+    private readonly logger: Logger
+  ) {}
 
   async connectMarketFeeds(symbols: readonly string[]): Promise<void> {
     for (const symbol of symbols) {
-      this.runtime.connectBinanceMarketData(symbol);
+      await this.runtime.connectMarketDataAdapter(new BinanceMarketDataAdapter(symbol, this.config, this.clock, this.logger));
     }
     this.marketConnected = symbols.length > 0;
   }
@@ -124,7 +130,7 @@ export class OperationalBootstrap {
       ...(deps.liveExecution === undefined ? {} : { liveExecution: deps.liveExecution })
     });
     this.governance = deps.governance ?? new GovernanceStateMachine();
-    this.feeds = deps.feeds ?? new DefaultRuntimeFeedConnector(this.runtime);
+    this.feeds = deps.feeds ?? new DefaultRuntimeFeedConnector(this.runtime, this.config, logger);
     this.heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 1_000;
     this.verifyReplayIntegrity = deps.verifyReplayIntegrity ?? (() => this.runtime.replayPersisted());
     this.verifyStartupReconciliation = deps.verifyStartupReconciliation ?? (() => this.defaultStartupReconciliation());

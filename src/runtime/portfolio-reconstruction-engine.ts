@@ -18,6 +18,8 @@ export class PortfolioReconstructionEngine {
     positions?: Record<string, number>;
     balances?: Record<string, number>;
     realizedPnlUsd?: number;
+    feesUsd?: number;
+    fundingUsd?: number;
     requiredFillIds?: string[];
   }): PortfolioReconstructionResult {
     const engine = new PortfolioStateEngine();

@@ -17,6 +17,9 @@ export const CURRENT_EVENT_VERSIONS: Record<CanonicalEventType, EventVersion> = 
   ORDER_REJECTED: { eventType: "ORDER_REJECTED", version: 1, introducedAt: "execution" },
   EXECUTION_ERROR: { eventType: "EXECUTION_ERROR", version: 1, introducedAt: "live-execution" },
   POSITION_UPDATED: { eventType: "POSITION_UPDATED", version: 1, introducedAt: "portfolio" },
+  FEE_CHARGED: { eventType: "FEE_CHARGED", version: 1, introducedAt: "portfolio-accounting" },
+  FUNDING_FEE_APPLIED: { eventType: "FUNDING_FEE_APPLIED", version: 1, introducedAt: "portfolio-accounting" },
+  REALIZED_PNL_UPDATED: { eventType: "REALIZED_PNL_UPDATED", version: 1, introducedAt: "portfolio-accounting" },
   RISK_ALERT: { eventType: "RISK_ALERT", version: 1, introducedAt: "risk" },
   SAFE_MODE: { eventType: "SAFE_MODE", version: 1, introducedAt: "safety" }
 };

@@ -1,15 +1,10 @@
 import { AuditLog, type AuditEntry, type AuditSink } from "../audit/audit-log.js";
 import { NoopNotifier, TelegramNotifier, type AlertNotifier } from "../alerts/telegram-notifier.js";
 import { authorityForExchangeEvent, resolveConflict, type AuthoritativeState, type ExchangeAuthority } from "../arbitration/exchange-state-authority.js";
-import {
-  BinanceMarketStream,
-  normalizeBinanceMarketPayload,
-  type BinanceMarketStreamKind,
-  type MarketStreamLifecycle
-} from "../adapters/binance.js";
 import type { EventInput, RuntimeEvent } from "../core/event.js";
 import { RuntimeEventSchema } from "../core/event.js";
 import { SystemClock, type Clock } from "../core/clock.js";
+import type { Clock as AlertClock } from "../infra/clock.js";
 import { rootCorrelationId } from "../core/ids.js";
 import { ExecutionEngine } from "../execution/execution-engine.js";
 import { PaperFillSimulator, type MarketSnapshot } from "../execution/paper-fill-simulator.js";
@@ -52,6 +47,17 @@ import {
   type ProcessSurvivabilityDecision,
   type ProcessSurvivabilitySample
 } from "./process-survivability.js";
+import {
+  assertAdapterNeutralMarketEvent,
+  type MarketDataAdapterLifecycleEvent,
+  type RuntimeMarketDataAdapter
+} from "./market-data-adapter.js";
+import { AlertAggregator } from "../notifications/alert-aggregator.js";
+import { AlertDeduplicator } from "../notifications/alert-deduplicator.js";
+import { AlertRouter } from "../notifications/alert-router.js";
+import { assertSerializableAlert, type StructuredAlertPayload } from "../notifications/alert-types.js";
+import { RuntimeJournal } from "./runtime-journal.js";
+import { RuntimeTimeline } from "./runtime-timeline.js";
 
 type RuntimeRiskConfig = RuntimeConfig;
 
@@ -70,6 +76,11 @@ type RuntimeDeps = {
   shutdown?: ShutdownController;
   clock?: Clock;
   liveExecution?: BinanceLiveExecution;
+  alertRouter?: AlertRouter;
+  alertDeduplicator?: AlertDeduplicator;
+  alertAggregator?: AlertAggregator;
+  runtimeJournal?: RuntimeJournal;
+  runtimeTimeline?: RuntimeTimeline;
 };
 
 export interface IngestOptions {
@@ -194,13 +205,23 @@ export class TradingRuntime {
 
   private readonly clock: Clock;
 
-  private readonly alertSentAtByKey = new Map<string, number>();
+  private readonly alertRouter: AlertRouter;
+
+  private readonly alertDeduplicator: AlertDeduplicator;
+
+  private readonly alertAggregator: AlertAggregator;
+
+  private readonly runtimeJournal: RuntimeJournal;
+
+  private readonly runtimeTimeline: RuntimeTimeline;
 
   private static readonly ALERT_DEDUPE_WINDOW_MS = 60_000;
 
+  private static readonly ALERT_AGGREGATION_WINDOW_MS = 300_000;
+
   private static readonly PERSISTED_SEQ_SCAN_BATCH_SIZE = 10_000;
 
-  private readonly marketStreams: BinanceMarketStream[] = [];
+  private readonly marketDataAdapters: RuntimeMarketDataAdapter[] = [];
 
   private shutdownStarted = false;
 
@@ -297,6 +318,18 @@ export class TradingRuntime {
     this.audit = deps?.audit ?? new AuditLog(this.logger);
     this.notifier = deps?.notifier ?? (this.config.telegramAlertsEnabled ? new TelegramNotifier(this.config) : new NoopNotifier());
     this.clock = deps?.clock ?? new SystemClock();
+    const alertClock = this.alertClock();
+    this.alertRouter = deps?.alertRouter ?? new AlertRouter();
+    this.alertDeduplicator = deps?.alertDeduplicator ?? new AlertDeduplicator(alertClock, {
+      ttlMs: TradingRuntime.ALERT_DEDUPE_WINDOW_MS,
+      maxSuppressionCount: 100
+    });
+    this.alertAggregator = deps?.alertAggregator ?? new AlertAggregator(alertClock, {
+      windowMs: TradingRuntime.ALERT_AGGREGATION_WINDOW_MS,
+      emitThreshold: 10
+    });
+    this.runtimeJournal = deps?.runtimeJournal ?? new RuntimeJournal();
+    this.runtimeTimeline = deps?.runtimeTimeline ?? new RuntimeTimeline();
     this.seenSeq = new BoundedIdSet<number>(this.config.idempotencyCacheSize);
     this.seenEventIds = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
     this.submittedOrderKeys = new BoundedIdSet<string>(this.config.idempotencyCacheSize);
@@ -354,10 +387,10 @@ export class TradingRuntime {
     this.shutdownStarted = true;
     this.running = false;
 
-    for (const stream of this.marketStreams) {
-      stream.close();
+    for (const adapter of this.marketDataAdapters) {
+      await adapter.stop();
     }
-    this.marketStreams.length = 0;
+    this.marketDataAdapters.length = 0;
     this.liveExecution.close();
 
     if (this.timer) {
@@ -756,20 +789,12 @@ export class TradingRuntime {
     return decision;
   }
 
-  connectBinanceMarketData(symbol: string): void {
-    // TODO(runtime-boundary): move this Binance-specific compatibility bridge into adapter orchestration.
-    // TradingRuntime should eventually depend only on RuntimeMarketDataAdapter and canonical EventInput.
-    const stream = new BinanceMarketStream(
-      this.config,
-      this.clock,
-      this.logger,
+  async connectMarketDataAdapter(adapter: RuntimeMarketDataAdapter): Promise<void> {
+    await adapter.start(
       (event) => this.ingestExternalMarketEvent(event),
-      (event) => this.handleMarketStreamLifecycle(event)
+      (event) => this.handleMarketDataAdapterLifecycle(event)
     );
-    stream.connectBookTicker(symbol);
-    stream.connectTrades(symbol);
-    stream.connectMarkPrice(symbol);
-    this.marketStreams.push(stream);
+    this.marketDataAdapters.push(adapter);
   }
 
   async connectBinanceUserStream(symbols: readonly string[]): Promise<void> {
@@ -799,32 +824,8 @@ export class TradingRuntime {
     return this.liveExecution.fetchStartupExchangeTruth(evidenceIds);
   }
 
-  async ingestBinanceMarketPayload(
-    stream: BinanceMarketStreamKind,
-    symbol: string,
-    payload: Record<string, unknown>,
-    receiveTimestamp?: number
-  ): Promise<void> {
-    // TODO(runtime-boundary): keep raw exchange payload normalization outside TradingRuntime.
-    // This method remains as a test/integration compatibility seam while adapters are being extracted.
-    try {
-      await this.ingestExternalMarketEvent(normalizeBinanceMarketPayload(stream, symbol, payload, receiveTimestamp ?? this.clock.nowMs()));
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "malformed_exchange_payload";
-      if (reason.startsWith("malformed_exchange_payload")) {
-        await this.enterSafeModeFromMarketStream(symbol, "malformed_exchange_payload", rootCorrelationId());
-      }
-      throw error;
-    }
-  }
-
   async ingestExternalMarketEvent(input: EventInput): Promise<void> {
-    if (input.source !== "binance_market_ws") {
-      throw new Error("external_market_event_source_invalid");
-    }
-    if (input.eventType !== "MARKET_TICK" && input.eventType !== "BOOK_UPDATE") {
-      throw new Error("external_market_event_type_invalid");
-    }
+    assertAdapterNeutralMarketEvent(input);
     const enveloped = this.withExchangeEnvelope(input);
     this.assertPayloadTrusted(enveloped);
     await this.ingestCausalExchangeEvent(enveloped);
@@ -839,7 +840,10 @@ export class TradingRuntime {
       input.eventType !== "ORDER_FILLED" &&
       input.eventType !== "ORDER_REJECTED" &&
       input.eventType !== "EXECUTION_ERROR" &&
-      input.eventType !== "POSITION_UPDATED"
+      input.eventType !== "POSITION_UPDATED" &&
+      input.eventType !== "FEE_CHARGED" &&
+      input.eventType !== "FUNDING_FEE_APPLIED" &&
+      input.eventType !== "REALIZED_PNL_UPDATED"
     ) {
       throw new Error("live_execution_event_type_invalid");
     }
@@ -892,19 +896,14 @@ export class TradingRuntime {
     }
   }
 
-  async handleMarketStreamLifecycle(event: {
-    action: MarketStreamLifecycle;
-    symbol: string;
-    stream: BinanceMarketStreamKind;
-    reason?: string;
-  }): Promise<void> {
+  async handleMarketDataAdapterLifecycle(event: MarketDataAdapterLifecycleEvent): Promise<void> {
     if (event.action === "reconnecting") {
       this.metrics.websocketReconnectCount += 1;
     }
     this.auditDecision({
       action: `market_stream_${event.action}`,
       symbol: event.symbol,
-      reason: event.reason ?? event.stream
+      reason: event.reason ?? event.stream ?? event.adapterId
     });
 
     if (event.action === "disconnected") {
@@ -1441,51 +1440,64 @@ export class TradingRuntime {
   }
 
   private alertForAuditEntry(entry: AuditEntry): void {
-    if (!this.shouldSendAlert(entry)) return;
-    const message = this.alertMessage(entry);
-    if (message === undefined) return;
+    const payload = this.alertPayload(entry);
+    if (payload === undefined) return;
+    this.emitStructuredAlert(payload);
+  }
+
+  private emitStructuredAlert(payload: StructuredAlertPayload): void {
+    assertSerializableAlert(payload);
+    const routed = this.alertRouter.route(payload);
+    const routedPayload = this.alertWithMode(routed.payload, routed.decision.mode);
+    const dedup = this.alertDeduplicator.check(routedPayload);
+    if (!dedup.accepted) {
+      this.audit.record({
+        action: "alert_deduplicated",
+        reason: "duplicate_alert_suppressed",
+        metrics: {
+          suppressedCount: dedup.suppressedCount,
+          firstSeenAt: dedup.firstSeenAt,
+          lastSeenAt: dedup.lastSeenAt
+        }
+      });
+      const aggregate = this.alertAggregator.record(routedPayload);
+      if (aggregate !== undefined) {
+        this.emitStructuredAlert(aggregate);
+      }
+      return;
+    }
+
+    const timestamp = this.clock.nowMs();
+    const timelineEntry = this.runtimeTimeline.appendAlert(timestamp, routedPayload);
+    this.runtimeJournal.appendTimelineEntry(timelineEntry);
+    if (routed.decision.persistentJournal) {
+      this.runtimeJournal.appendStructuredAlert(timestamp, routedPayload);
+    }
+    if (!routed.decision.telegram) return;
+
+    const message = buildTelegramAlert(routedPayload);
     void this.notifier.sendAlert(message).catch((error) => {
       this.audit.record({
-        action: "telegram_alert_failed",
-        reason: error instanceof Error ? error.message : "telegram_alert_failed"
+        action: "telegram_alert_send_failed",
+        reason: error instanceof Error ? error.message : "telegram_alert_send_failed"
       });
     });
   }
 
-  private shouldSendAlert(entry: AuditEntry): boolean {
-    const key = this.alertDedupeKey(entry);
-    if (key === undefined) return true;
-
-    const now = this.clock.nowMs();
-    const lastSentAt = this.alertSentAtByKey.get(key);
-    if (lastSentAt !== undefined && now - lastSentAt < TradingRuntime.ALERT_DEDUPE_WINDOW_MS) {
-      return false;
-    }
-    this.alertSentAtByKey.set(key, now);
-    return true;
+  private alertWithMode(payload: StructuredAlertPayload, mode: StructuredAlertPayload["mode"]): StructuredAlertPayload {
+    return { ...payload, mode } as StructuredAlertPayload;
   }
 
-  private alertDedupeKey(entry: AuditEntry): string | undefined {
-    if (
-      entry.action !== "safe_mode_entered" &&
-      entry.action !== "event_rejected" &&
-      entry.action !== "market_stream_disconnected" &&
-      entry.action !== "market_stream_reconnecting"
-    ) {
-      return undefined;
-    }
-
-    return [
-      entry.action,
-      entry.reason ?? "unknown",
-      entry.symbol ?? "global",
-      entry.eventType ?? "runtime"
-    ].join(":");
-  }
-
-  private alertMessage(entry: AuditEntry): string | undefined {
-    const payload = this.alertPayload(entry);
-    return payload === undefined ? undefined : buildTelegramAlert(payload);
+  private alertClock(): AlertClock {
+    return {
+      now: () => this.clock.nowMs(),
+      sleep: (ms: number) => {
+        if (ms !== 0) {
+          return Promise.reject(new Error("runtime_alert_clock_sleep_unsupported"));
+        }
+        return Promise.resolve();
+      }
+    };
   }
 
   private alertPayload(entry: AuditEntry): TelegramAlertPayload | undefined {

@@ -1,4 +1,5 @@
 import type { RuntimeEvent } from "../core/event.js";
+import { PrecisionMath } from "../infrastructure/PrecisionMath.js";
 
 export interface PortfolioPosition {
   symbol: string;
@@ -71,6 +72,9 @@ export class PortfolioStateEngine {
     if (event.seq <= this.lastSeq) throw new Error(`portfolio_event_out_of_order:${event.seq}`);
     if (event.eventType === "ORDER_FILLED") this.applyFill(event);
     if (event.eventType === "POSITION_UPDATED") this.applyPositionUpdate(event);
+    if (event.eventType === "FEE_CHARGED") this.applyFee(event);
+    if (event.eventType === "FUNDING_FEE_APPLIED") this.applyFunding(event);
+    if (event.eventType === "REALIZED_PNL_UPDATED") this.applyRealizedPnl(event);
     if (event.eventType === "MARKET_TICK" || event.eventType === "BOOK_UPDATE") this.applyMark(event);
     this.lastSeq = event.seq;
     return this.snapshot();
@@ -117,6 +121,8 @@ export class PortfolioStateEngine {
     positions?: Record<string, number>;
     balances?: Record<string, number>;
     realizedPnlUsd?: number;
+    feesUsd?: number;
+    fundingUsd?: number;
   }, tolerance = 1e-8): PortfolioDivergenceReport {
     const snapshot = this.snapshot();
     const divergences: PortfolioDivergence[] = [];
@@ -140,6 +146,22 @@ export class PortfolioStateEngine {
         reason: "realized_pnl_mismatch"
       });
     }
+    if (expected.feesUsd !== undefined && Math.abs(snapshot.feesUsd - expected.feesUsd) > tolerance) {
+      divergences.push({
+        type: "expected_pnl_mismatch",
+        expected: expected.feesUsd,
+        actual: snapshot.feesUsd,
+        reason: "fees_mismatch"
+      });
+    }
+    if (expected.fundingUsd !== undefined && Math.abs(snapshot.fundingUsd - expected.fundingUsd) > tolerance) {
+      divergences.push({
+        type: "expected_pnl_mismatch",
+        expected: expected.fundingUsd,
+        actual: snapshot.fundingUsd,
+        reason: "funding_mismatch"
+      });
+    }
     return { divergent: divergences.length > 0, divergences };
   }
 
@@ -155,22 +177,31 @@ export class PortfolioStateEngine {
     const quantity = fillQuantity(event);
     const price = numberPayload(event, "price");
     if (quantity === undefined || price === undefined || quantity === 0 || price <= 0) return;
-    const feeUsd = numberPayload(event, "feeUsd") ?? numberPayload(event, "commissionUsd") ?? 0;
-    const fundingUsd = numberPayload(event, "fundingUsd") ?? 0;
+    const feeUsd = decimalPayload(event, "feeUsd") ?? decimalPayload(event, "commissionUsd") ?? "0";
+    const fundingUsd = decimalPayload(event, "fundingUsd") ?? "0";
     const balanceDeltaUsd = numberPayload(event, "balanceDeltaUsd") ?? 0;
     const position = this.positions.get(event.symbol) ?? emptyPosition(event.symbol);
     const wasFlat = position.quantity === 0;
     const realizedBeforeCosts = this.applyPositionFill(position, quantity, price);
-    position.feesUsd += feeUsd;
-    position.fundingUsd += fundingUsd;
-    position.realizedPnlUsd = money(position.realizedPnlUsd + realizedBeforeCosts - feeUsd + fundingUsd);
+    this.addFeeToPosition(position, feeUsd);
+    this.addFundingToPosition(position, fundingUsd);
+    position.realizedPnlUsd = decimalToNumber(PrecisionMath.add(
+      PrecisionMath.add(decimalFromNumber(position.realizedPnlUsd), decimalFromNumber(realizedBeforeCosts)),
+      PrecisionMath.subtract(fundingUsd, feeUsd)
+    ));
     if (wasFlat && position.quantity !== 0) position.openedAtSeq = event.seq;
     if (position.quantity === 0) position.closedAtSeq = event.seq;
     if (event.payload.liquidation === true) position.liquidations += 1;
-    this.realizedPnlUsd = money(this.realizedPnlUsd + realizedBeforeCosts - feeUsd + fundingUsd);
-    this.feesUsd = money(this.feesUsd + feeUsd);
-    this.fundingUsd = money(this.fundingUsd + fundingUsd);
-    this.cashUsd = money(this.cashUsd + realizedBeforeCosts - feeUsd + fundingUsd + balanceDeltaUsd);
+    this.realizedPnlUsd = decimalToNumber(PrecisionMath.add(
+      PrecisionMath.add(decimalFromNumber(this.realizedPnlUsd), decimalFromNumber(realizedBeforeCosts)),
+      PrecisionMath.subtract(fundingUsd, feeUsd)
+    ));
+    this.feesUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.feesUsd), feeUsd));
+    this.fundingUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.fundingUsd), fundingUsd));
+    this.cashUsd = decimalToNumber(PrecisionMath.add(
+      PrecisionMath.add(decimalFromNumber(this.cashUsd), decimalFromNumber(realizedBeforeCosts)),
+      PrecisionMath.add(PrecisionMath.subtract(fundingUsd, feeUsd), decimalFromNumber(balanceDeltaUsd))
+    ));
     position.unrealizedPnlUsd = money((price - position.averagePrice) * position.quantity);
     this.positions.set(event.symbol, position);
     this.appliedFillIds.add(fillId);
@@ -190,6 +221,48 @@ export class PortfolioStateEngine {
       realizedPnlUsd: realizedPnl,
       unrealizedPnlUsd: unrealizedPnl
     });
+  }
+
+  private applyFee(event: RuntimeEvent): void {
+    const feeUsd = accountingAmount(event, ["amountUsd", "feeUsd", "commissionUsd"]);
+    if (feeUsd === undefined) return;
+    const position = this.positions.get(event.symbol) ?? emptyPosition(event.symbol);
+    this.addFeeToPosition(position, feeUsd);
+    position.realizedPnlUsd = decimalToNumber(PrecisionMath.subtract(decimalFromNumber(position.realizedPnlUsd), feeUsd));
+    this.positions.set(event.symbol, position);
+    this.feesUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.feesUsd), feeUsd));
+    this.realizedPnlUsd = decimalToNumber(PrecisionMath.subtract(decimalFromNumber(this.realizedPnlUsd), feeUsd));
+    this.cashUsd = decimalToNumber(PrecisionMath.subtract(decimalFromNumber(this.cashUsd), feeUsd));
+  }
+
+  private applyFunding(event: RuntimeEvent): void {
+    const fundingUsd = accountingAmount(event, ["amountUsd", "fundingUsd", "fundingFeeUsd"]);
+    if (fundingUsd === undefined) return;
+    const position = this.positions.get(event.symbol) ?? emptyPosition(event.symbol);
+    this.addFundingToPosition(position, fundingUsd);
+    position.realizedPnlUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(position.realizedPnlUsd), fundingUsd));
+    this.positions.set(event.symbol, position);
+    this.fundingUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.fundingUsd), fundingUsd));
+    this.realizedPnlUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.realizedPnlUsd), fundingUsd));
+    this.cashUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.cashUsd), fundingUsd));
+  }
+
+  private applyRealizedPnl(event: RuntimeEvent): void {
+    const realizedPnlUsd = accountingAmount(event, ["amountUsd", "realizedPnlUsd", "realizedPnlDeltaUsd"]);
+    if (realizedPnlUsd === undefined) return;
+    const position = this.positions.get(event.symbol) ?? emptyPosition(event.symbol);
+    position.realizedPnlUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(position.realizedPnlUsd), realizedPnlUsd));
+    this.positions.set(event.symbol, position);
+    this.realizedPnlUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.realizedPnlUsd), realizedPnlUsd));
+    this.cashUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(this.cashUsd), realizedPnlUsd));
+  }
+
+  private addFeeToPosition(position: PortfolioPosition, feeUsd: string): void {
+    position.feesUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(position.feesUsd), feeUsd));
+  }
+
+  private addFundingToPosition(position: PortfolioPosition, fundingUsd: string): void {
+    position.fundingUsd = decimalToNumber(PrecisionMath.add(decimalFromNumber(position.fundingUsd), fundingUsd));
   }
 
   private applyMark(event: RuntimeEvent): void {
@@ -256,6 +329,32 @@ function numberPayload(event: RuntimeEvent, key: string): number | undefined {
   const value = event.payload[key];
   const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   return Number.isFinite(number) ? number : undefined;
+}
+
+function decimalPayload(event: RuntimeEvent, key: string): string | undefined {
+  const value = event.payload[key];
+  if (typeof value === "string") return PrecisionMath.assertDecimal(value, key);
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return PrecisionMath.assertDecimal(String(value), key);
+}
+
+function accountingAmount(event: RuntimeEvent, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const amount = decimalPayload(event, key);
+    if (amount !== undefined) return amount;
+  }
+  return undefined;
+}
+
+function decimalFromNumber(value: number): string {
+  if (!Number.isFinite(value)) throw new Error("portfolio_decimal_number_invalid");
+  return PrecisionMath.assertDecimal(String(value), "portfolio_decimal");
+}
+
+function decimalToNumber(value: string): number {
+  const number = Number(PrecisionMath.normalize(value));
+  if (!Number.isFinite(number)) throw new Error("portfolio_decimal_conversion_invalid");
+  return number;
 }
 
 function midPrice(event: RuntimeEvent): number | undefined {

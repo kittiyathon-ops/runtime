@@ -11,6 +11,9 @@ export const EventTypeSchema = z.enum([
   "ORDER_REJECTED",
   "EXECUTION_ERROR",
   "POSITION_UPDATED",
+  "FEE_CHARGED",
+  "FUNDING_FEE_APPLIED",
+  "REALIZED_PNL_UPDATED",
   "RISK_ALERT",
   "SAFE_MODE"
 ]);
@@ -18,6 +21,7 @@ export const EventTypeSchema = z.enum([
 export type EventType = z.infer<typeof EventTypeSchema>;
 
 export const SourceSchema = z.enum([
+  "market_data_adapter",
   "binance_market_ws",
   "binance_user_ws",
   "runtime",

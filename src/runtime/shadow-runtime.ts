@@ -21,5 +21,8 @@ export class ShadowRuntime {
   snapshot(): ShadowRuntimeState {
     return structuredClone(this.state);
   }
-}
 
+  submitOrder(_intent: unknown): never {
+    throw new Error("shadow_runtime_cannot_submit_orders");
+  }
+}

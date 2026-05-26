@@ -1,5 +1,6 @@
 import type { RuntimeEvent } from "../core/event.js";
 import type { StructuredAlertPayload } from "../notifications/alert-types.js";
+import type { RuntimeTimelineEntry } from "./runtime-timeline.js";
 
 export type JournalEntryType =
   | "runtime_event"
@@ -8,6 +9,7 @@ export type JournalEntryType =
   | "state_transition"
   | "replay_marker"
   | "governance_transition"
+  | "timeline_entry"
   | "structured_alert";
 
 export interface JournalEntry {
@@ -55,6 +57,23 @@ export class RuntimeJournal {
 
   appendStructuredAlert(timestamp: number, alert: StructuredAlertPayload): JournalEntry {
     return this.append("structured_alert", timestamp, { alert });
+  }
+
+  appendTimelineEntry(entry: RuntimeTimelineEntry): JournalEntry {
+    return this.append("timeline_entry", entry.timestamp, {
+      timelineEntry: {
+        timelineSeq: entry.timelineSeq,
+        timestamp: entry.timestamp,
+        ...(entry.sequence === undefined ? {} : { sequence: entry.sequence }),
+        severity: entry.severity,
+        type: entry.type,
+        tags: [...entry.tags],
+        ...(entry.correlation === undefined ? {} : { correlation: entry.correlation }),
+        summaryKey: entry.summaryKey,
+        ...(entry.runtimeState === undefined ? {} : { runtimeState: entry.runtimeState }),
+        payload: entry.payload
+      }
+    }, entry.sequence === undefined ? {} : { eventSeq: entry.sequence });
   }
 
   readFrom(cursor: JournalCursor, limit: number): JournalEntry[] {
