@@ -58,6 +58,9 @@ import { AlertRouter } from "../notifications/alert-router.js";
 import { assertSerializableAlert, type StructuredAlertPayload } from "../notifications/alert-types.js";
 import { RuntimeJournal } from "./runtime-journal.js";
 import { RuntimeTimeline } from "./runtime-timeline.js";
+import { GovernanceStateMachine, type GovernanceState } from "./governance-state-machine.js";
+import { EdgeGovernanceOrchestrator } from "../edge/edge-orchestrator.js";
+import type { EdgeDegradationRecommendation } from "../edge/edge-degradation.js";
 
 type RuntimeRiskConfig = RuntimeConfig;
 
@@ -310,12 +313,20 @@ export class TradingRuntime {
 
   public readonly checkpoints = new CheckpointManager();
 
+  public readonly governanceStateMachine = new GovernanceStateMachine();
+
+  private readonly edgeOrchestrator: EdgeGovernanceOrchestrator;
+
   constructor(private readonly deps?: RuntimeDeps) {
     this.config = ConfigSchema.parse(deps?.config ?? {});
     this.logger = deps?.logger ?? createLogger(this.config);
     this.events = deps?.eventBus ?? new AsyncEventBus(this.config.eventQueueCapacity);
     this.eventStore = deps?.eventStore ?? new SqliteEventStore(this.config.sqlitePath);
     this.audit = deps?.audit ?? new AuditLog(this.logger);
+    this.edgeOrchestrator = new EdgeGovernanceOrchestrator({
+      governance: this.governanceStateMachine,
+      audit: this.audit
+    });
     this.notifier = deps?.notifier ?? (this.config.telegramAlertsEnabled ? new TelegramNotifier(this.config) : new NoopNotifier());
     this.clock = deps?.clock ?? new SystemClock();
     const alertClock = this.alertClock();
@@ -791,8 +802,8 @@ export class TradingRuntime {
 
   async connectMarketDataAdapter(adapter: RuntimeMarketDataAdapter): Promise<void> {
     await adapter.start(
-      (event) => this.ingestExternalMarketEvent(event),
-      (event) => this.handleMarketDataAdapterLifecycle(event)
+      (event: EventInput) => this.ingestExternalMarketEvent(event),
+      (event: MarketDataAdapterLifecycleEvent) => this.handleMarketDataAdapterLifecycle(event)
     );
     this.marketDataAdapters.push(adapter);
   }
@@ -908,6 +919,13 @@ export class TradingRuntime {
 
     if (event.action === "disconnected") {
       this.risk.halt("websocket_disconnect");
+      const rec: EdgeDegradationRecommendation = {
+        recommendation: "SAFE_MODE",
+        severity: "CRITICAL",
+        reasons: ["websocket_disconnect"]
+      };
+      const decision = this.edgeOrchestrator.apply(rec, event.adapterId);
+      this.applyGovernanceToRuntime(decision.targetState);
       await this.enterSafeModeFromMarketStream(event.symbol, "websocket_disconnect", rootCorrelationId());
       return;
     }
@@ -917,7 +935,46 @@ export class TradingRuntime {
         ? "malformed_exchange_payload"
         : "stale_market_stream";
       this.risk.halt(reason);
+      const rec: EdgeDegradationRecommendation = {
+        recommendation: "SAFE_MODE",
+        severity: "CRITICAL",
+        reasons: [reason]
+      };
+      const decision = this.edgeOrchestrator.apply(rec, event.adapterId);
+      this.applyGovernanceToRuntime(decision.targetState);
       await this.enterSafeModeFromMarketStream(event.symbol, reason, rootCorrelationId());
+    }
+  }
+
+  private applyGovernanceToRuntime(governanceState: GovernanceState | undefined): void {
+    if (governanceState === undefined) return;
+    const current = this.state.mode();
+    // Terminal or already settled — nothing to do
+    if (current === "HALTED" || current === "STOPPING" || current === "GOVERNANCE_HALT") return;
+
+    let targetMode: RuntimeMode | undefined;
+    if (governanceState === "GOVERNANCE_HALT" || governanceState === "HALTED") {
+      targetMode = "GOVERNANCE_HALT";
+    } else if (governanceState === "SAFE_MODE") {
+      targetMode = "SAFE_MODE";
+    } else if (governanceState === "HIBERNATION_MODE") {
+      targetMode = "HIBERNATION_MODE";
+    }
+
+    if (targetMode === undefined || targetMode === current) return;
+
+    try {
+      this.state.transition(targetMode, ["runtime_transition"]);
+      this.auditDecision({
+        action: "governance_state_applied_to_runtime",
+        reason: `governance_state:${governanceState}->runtime_mode:${targetMode}`
+      });
+    } catch (error) {
+      // Fail closed: log but do not suppress the original safe-mode path
+      this.auditDecision({
+        action: "governance_state_bridge_failed",
+        reason: error instanceof Error ? error.message : "governance_bridge_transition_failed"
+      });
     }
   }
 

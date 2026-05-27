@@ -55,6 +55,7 @@ import { BinanceEventNormalizer } from "../src/adapters/binance/binance-event-no
 import { BinanceWebsocket } from "../src/adapters/binance/binance-websocket.js";
 import { BinanceMarketStream } from "../src/adapters/binance.js";
 import { normalizeBinanceMarketPayloadForAdapter } from "../src/adapters/binance-market-data-adapter.js";
+import type { MarketDataEventSink, MarketDataLifecycleSink } from "../src/runtime/market-data-adapter.js";
 import { RiskGovernor } from "../src/runtime/risk-governor.js";
 import { ExecutionKernel } from "../src/runtime/execution-kernel.js";
 import { PortfolioStateEngine } from "../src/runtime/portfolio-state-engine.js";
@@ -3260,7 +3261,7 @@ test("runtime ingests market data through generic adapter without Binance payloa
 
   await runtime.connectMarketDataAdapter({
     id: "generic-market-adapter",
-    async start(sink, lifecycleSink) {
+    async start(sink: MarketDataEventSink, lifecycleSink: MarketDataLifecycleSink) {
       await sink({
         eventId: "generic:book:10",
         receiveTimestamp: 1_700_000_000_100,

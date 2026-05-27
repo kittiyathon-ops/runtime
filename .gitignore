@@ -5,6 +5,12 @@ coverage/
 .env.local
 .env.production
 *.log
+*.zip
+project-export.txt
+project-export.zip
+project-review-light/
+project-review*
+runtime.out.log
 *.local.ps1
 checkpoints/
 replays/

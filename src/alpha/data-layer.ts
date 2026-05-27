@@ -1,3 +1,12 @@
+/**
+ * Alpha Lab Data Layer
+ *
+ * Multi-timeframe dataset builder for alpha research pipeline.
+ * NOT part of the production runtime execution path.
+ */
+
+import type { AlphaDataConfig } from "./alpha-config.js";
+
 export interface AlphaCandle {
   readonly timestampMs: number;
   readonly open: number;
@@ -5,59 +14,53 @@ export interface AlphaCandle {
   readonly low: number;
   readonly close: number;
   readonly volume: number;
+  readonly timeframe: string;
+  readonly symbol: string;
 }
 
-export type AlphaDataset = ReadonlyMap<string, readonly AlphaCandle[]>;
+export class MultiTimeframeDataset {
+  private readonly data = new Map<string, readonly AlphaCandle[]>();
+  readonly symbols: readonly string[];
+  readonly timeframes: readonly string[];
+  readonly generatedAt: number;
+
+  constructor(
+    data: ReadonlyMap<string, readonly AlphaCandle[]>,
+    symbols: readonly string[],
+    timeframes: readonly string[],
+    generatedAt: number
+  ) {
+    for (const [key, candles] of data) {
+      this.data.set(key, candles);
+    }
+    this.symbols = symbols;
+    this.timeframes = timeframes;
+    this.generatedAt = generatedAt;
+  }
+
+  get(key: string): readonly AlphaCandle[] | undefined {
+    return this.data.get(key);
+  }
+}
 
 export class DataLayer {
-  constructor(
-    private readonly config: {
-      readonly symbols: readonly string[];
-      readonly timeframes: readonly string[];
-    }
-  ) {}
+  constructor(private readonly config: AlphaDataConfig) {}
 
-  buildMultiTimeframeDataset(): AlphaDataset {
-    const entries: Array<[string, readonly AlphaCandle[]]> = [];
+  buildMultiTimeframeDataset(): MultiTimeframeDataset {
+    const data = new Map<string, readonly AlphaCandle[]>();
 
     for (const symbol of this.config.symbols) {
       for (const timeframe of this.config.timeframes) {
-        entries.push([
-          `${symbol}_${timeframe}`,
-          syntheticCandles(symbol, timeframe)
-        ]);
+        const key = `${symbol}_${timeframe}`;
+        data.set(key, []);
       }
     }
 
-    return new Map(entries);
+    return new MultiTimeframeDataset(
+      data,
+      [...this.config.symbols],
+      [...this.config.timeframes],
+      0
+    );
   }
-}
-
-function syntheticCandles(symbol: string, timeframe: string): readonly AlphaCandle[] {
-  const seed = [...`${symbol}_${timeframe}`].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-  const candles: AlphaCandle[] = [];
-
-  let price = 2000 + (seed % 100);
-
-  for (let index = 0; index < 300; index += 1) {
-    const wave = Math.sin((index + seed) / 12) * 3;
-    const drift = index * 0.03;
-    const close = price + wave + drift;
-    const open = price;
-    const high = Math.max(open, close) + 1;
-    const low = Math.min(open, close) - 1;
-
-    candles.push({
-      timestampMs: 1_700_000_000_000 + index * 60_000,
-      open,
-      high,
-      low,
-      close,
-      volume: 100 + ((index + seed) % 50)
-    });
-
-    price = close;
-  }
-
-  return candles;
 }

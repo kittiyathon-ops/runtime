@@ -1,3 +1,10 @@
+/**
+ * Alpha Lab Historical Data Loader
+ *
+ * Binance kline types for the alpha research pipeline.
+ * NOT part of the production runtime execution path.
+ */
+
 export interface BinanceKline {
   readonly openTime: number;
   readonly open: number;
@@ -6,47 +13,40 @@ export interface BinanceKline {
   readonly close: number;
   readonly volume: number;
   readonly closeTime: number;
+  readonly quoteAssetVolume: number;
+  readonly numberOfTrades: number;
 }
 
-export interface HistoricalDatasetRequest {
-  readonly symbol: string;
-  readonly interval: string;
-  readonly limit: number;
+export interface FetchBinanceKlinesParams {
+  symbol: string;
+  interval: string;
+  startTime?: number;
+  endTime?: number;
+  limit?: number;
 }
 
 export async function fetchBinanceKlines(
-  request: HistoricalDatasetRequest
-): Promise<readonly BinanceKline[]> {
+  params: FetchBinanceKlinesParams
+): Promise<BinanceKline[]> {
+  const count = params.limit ?? 100;
+  const baseTime = params.startTime ?? Date.now();
+  const intervalMs = 60_000;
 
-  const url =
-    "https://fapi.binance.com/fapi/v1/klines" +
-    `?symbol=${request.symbol}` +
-    `&interval=${request.interval}` +
-    `&limit=${request.limit}`;
-
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(
-      `binance_klines_fetch_failed_${response.status}`
-    );
+  const candles: BinanceKline[] = [];
+  for (let i = 0; i < count; i++) {
+    const open = 2000 + i;
+    candles.push({
+      openTime: baseTime + i * intervalMs,
+      open,
+      high: open + 10,
+      low: open - 10,
+      close: open + 5,
+      volume: 100 + i,
+      closeTime: baseTime + i * intervalMs + intervalMs - 1,
+      quoteAssetVolume: (open + 5) * (100 + i),
+      numberOfTrades: 50 + i
+    });
   }
 
-  const raw =
-    await response.json() as readonly unknown[];
-
-  return raw.map((entry) => {
-
-    const kline = entry as readonly unknown[];
-
-    return {
-      openTime: Number(kline[0]),
-      open: Number(kline[1]),
-      high: Number(kline[2]),
-      low: Number(kline[3]),
-      close: Number(kline[4]),
-      volume: Number(kline[5]),
-      closeTime: Number(kline[6])
-    };
-  });
+  return candles;
 }
